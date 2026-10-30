@@ -109,7 +109,19 @@ detect_shell_rc() {
   user_shell="$(basename "${SHELL:-/bin/bash}")"
   case "$user_shell" in
     zsh)
-      printf '%s/.zshrc\n' "$HOME"
+      local zdotdir="${ZDOTDIR:-}"
+      if [[ -z "$zdotdir" ]] && [[ -f "$HOME/.zshenv" ]] && grep -Eq 'ZDOTDIR=' "$HOME/.zshenv" 2>/dev/null; then
+        zdotdir="$(grep -E '^[[:space:]]*(export[[:space:]]+)?ZDOTDIR=' "$HOME/.zshenv" | head -n 1 | sed -E 's/.*ZDOTDIR=["'\'']?([^"'\'']+)["'\'']?/\1/' | sed "s|~|$HOME|" | sed "s|\$HOME|$HOME|")"
+      fi
+      if [[ -n "$zdotdir" ]] && [[ -f "${zdotdir}/.zshrc" ]]; then
+        printf '%s/.zshrc\n' "$zdotdir"
+      elif [[ -f "$HOME/.config/zsh/.zshrc" ]]; then
+        printf '%s/.config/zsh/.zshrc\n' "$HOME"
+      elif [[ -f "$HOME/.zshrc" ]]; then
+        printf '%s/.zshrc\n' "$HOME"
+      else
+        printf '%s/.zshrc\n' "$HOME"
+      fi
       ;;
     fish)
       printf '%s/.config/fish/config.fish\n' "$HOME"
@@ -154,6 +166,13 @@ check_direnv_hook() {
 
   if [[ -f "$rc_file" ]]; then
     if grep -Eq 'direnv[[:space:]]+hook' "$rc_file" 2>/dev/null; then
+      return 0
+    fi
+  fi
+
+  if [[ "$user_shell" == "zsh" ]]; then
+    local zdotdir="${ZDOTDIR:-$HOME/.config/zsh}"
+    if [[ -d "${zdotdir}/conf.d" ]] && grep -Eqr 'direnv[[:space:]]+hook' "${zdotdir}/conf.d" 2>/dev/null; then
       return 0
     fi
   fi
