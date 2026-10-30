@@ -4,14 +4,14 @@
 #
 # Usage:
 #   ./install.sh [OPTIONS]
-#   curl -fsSL https://raw.githubusercontent.com/mouda/denv/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/E1r0y/denv/main/install.sh | bash
 #
 
 set -Eeuo pipefail
 
 readonly INSTALLER_VERSION="1.3.0"
 readonly SCRIPT_NAME="denv"
-readonly REPO_DEFAULT="mouda/denv"
+readonly REPO_DEFAULT="E1r0y/denv"
 readonly RAW_BASE_URL="https://raw.githubusercontent.com/${DENV_REPO:-$REPO_DEFAULT}/main"
 
 # Exit codes
@@ -126,10 +126,11 @@ detect_shell_rc() {
 }
 
 check_prerequisites() {
-  # 1. Check Bash version >= 4
+  # 1. Check Bash version >= 3.2
   local bash_major="${BASH_VERSINFO[0]:-0}"
-  if [[ "$bash_major" -lt 4 ]]; then
-    log_error "denv requires Bash version 4.0 or higher (current: ${BASH_VERSION})."
+  local bash_minor="${BASH_VERSINFO[1]:-0}"
+  if [[ "$bash_major" -lt 3 ]] || { [[ "$bash_major" -eq 3 ]] && [[ "$bash_minor" -lt 2 ]]; }; then
+    log_error "denv requires Bash version 3.2 or higher (current: ${BASH_VERSION})."
     exit "$EX_ERR"
   fi
 

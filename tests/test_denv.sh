@@ -317,6 +317,119 @@ test_flag_injection_defense() {
   fi
 }
 
+test_backend_detection_lockfiles() {
+  local tmp="$1"
+  local out
+
+  # 1. uv.lock
+  touch "${tmp}/uv.lock"
+  out="$("$DENV_BIN" status "$tmp")"
+  assert_contains "$out" "uv" "Status must detect uv"
+  assert_contains "$out" "uv.lock" "Source must be uv.lock"
+  rm -f "${tmp}/uv.lock"
+
+  # 2. poetry.lock
+  touch "${tmp}/poetry.lock"
+  out="$("$DENV_BIN" status "$tmp")"
+  assert_contains "$out" "poetry" "Status must detect poetry"
+  assert_contains "$out" "poetry.lock" "Source must be poetry.lock"
+  rm -f "${tmp}/poetry.lock"
+
+  # 3. Pipfile
+  touch "${tmp}/Pipfile"
+  out="$("$DENV_BIN" status "$tmp")"
+  assert_contains "$out" "pipenv" "Status must detect pipenv"
+  assert_contains "$out" "Pipfile" "Source must be Pipfile"
+  rm -f "${tmp}/Pipfile"
+
+  # 4. pdm.lock
+  touch "${tmp}/pdm.lock"
+  out="$("$DENV_BIN" status "$tmp")"
+  assert_contains "$out" "pdm" "Status must detect pdm"
+  assert_contains "$out" "pdm.lock" "Source must be pdm.lock"
+  rm -f "${tmp}/pdm.lock"
+
+  # 5. pixi.toml
+  touch "${tmp}/pixi.toml"
+  out="$("$DENV_BIN" status "$tmp")"
+  assert_contains "$out" "pixi" "Status must detect pixi"
+  assert_contains "$out" "pixi.toml" "Source must be pixi.toml"
+  rm -f "${tmp}/pixi.toml"
+
+  # 6. hatch.toml
+  touch "${tmp}/hatch.toml"
+  out="$("$DENV_BIN" status "$tmp")"
+  assert_contains "$out" "hatch" "Status must detect hatch"
+  assert_contains "$out" "hatch.toml" "Source must be hatch.toml"
+  rm -f "${tmp}/hatch.toml"
+
+  # 7. environment.yml
+  cat <<'YAML' > "${tmp}/environment.yml"
+name: my-science-env
+channels:
+  - conda-forge
+YAML
+  out="$("$DENV_BIN" status "$tmp")"
+  assert_contains "$out" "conda" "Status must detect conda"
+  assert_contains "$out" "environment.yml" "Source must be environment.yml"
+  rm -f "${tmp}/environment.yml"
+}
+
+test_backend_detection_pyproject() {
+  local tmp="$1"
+  local out
+
+  # Poetry in pyproject.toml
+  cat <<'TOML' > "${tmp}/pyproject.toml"
+[tool.poetry]
+name = "sample-poetry"
+version = "0.1.0"
+TOML
+  out="$("$DENV_BIN" status "$tmp")"
+  assert_contains "$out" "poetry" "pyproject tool.poetry must be detected"
+  assert_contains "$out" "pyproject.toml" "Source must be pyproject.toml"
+
+  # PDM in pyproject.toml
+  cat <<'TOML' > "${tmp}/pyproject.toml"
+[tool.pdm]
+version = { source = "scm" }
+TOML
+  out="$("$DENV_BIN" status "$tmp")"
+  assert_contains "$out" "pdm" "pyproject tool.pdm must be detected"
+
+  # Hatch in pyproject.toml
+  cat <<'TOML' > "${tmp}/pyproject.toml"
+[tool.hatch.version]
+path = "src/__about__.py"
+TOML
+  out="$("$DENV_BIN" status "$tmp")"
+  assert_contains "$out" "hatch" "pyproject tool.hatch must be detected"
+}
+
+test_python_version_resolution() {
+  local tmp="$1"
+  printf '3.12.2\n' > "${tmp}/.python-version"
+  local out
+  out="$("$DENV_BIN" status "$tmp")"
+  assert_contains "$out" "Python version:      3.12.2" "Status must display valid .python-version"
+}
+
+test_clean_deletes_entire_unmodified_envrc() {
+  local tmp="$1"
+  local envrc="${tmp}/.envrc"
+
+  # Bootstrap fresh envrc
+  "$DENV_BIN" -n "$tmp" >/dev/null 2>&1
+  [[ -f "$envrc" ]] || { echo ".envrc was not created"; return 1; }
+
+  # Clean without any custom user settings added
+  "$DENV_BIN" clean "$tmp" >/dev/null 2>&1
+  if [[ -e "$envrc" ]]; then
+    echo ".envrc should be completely deleted when only managed denv block existed"
+    return 1
+  fi
+}
+
 # --- Main Suite Runner ---
 
 main() {
@@ -338,6 +451,10 @@ main() {
   run_test test_subcommand_version_flags
   run_test test_bash_completion_syntax
   run_test test_flag_injection_defense
+  run_test test_backend_detection_lockfiles
+  run_test test_backend_detection_pyproject
+  run_test test_python_version_resolution
+  run_test test_clean_deletes_entire_unmodified_envrc
 
   printf '\n--------------------------------------------------\n'
   printf 'Results: %d total, %s%d passed%s, %s%d failed%s.\n\n' \

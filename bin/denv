@@ -338,11 +338,11 @@ detect_backend() {
   elif [[ -f "${dir}/environment.yml" ]] || [[ -f "${dir}/environment.yaml" ]] || [[ -d "${dir}/.conda" ]]; then
     printf 'conda\n'
   elif [[ -f "${dir}/pyproject.toml" ]]; then
-    if grep -Eq '^[[:space:]]*\[tool\.poetry\]' "${dir}/pyproject.toml"; then
+    if grep -Eq '^[[:space:]]*\[tool\.poetry(\]|\.)' "${dir}/pyproject.toml"; then
       printf 'poetry\n'
-    elif grep -Eq '^[[:space:]]*\[tool\.pdm\]' "${dir}/pyproject.toml"; then
+    elif grep -Eq '^[[:space:]]*\[tool\.pdm(\]|\.)' "${dir}/pyproject.toml"; then
       printf 'pdm\n'
-    elif grep -Eq '^[[:space:]]*\[tool\.hatch\]' "${dir}/pyproject.toml"; then
+    elif grep -Eq '^[[:space:]]*\[tool\.hatch(\]|\.)' "${dir}/pyproject.toml"; then
       printf 'hatch\n'
     elif command -v uv >/dev/null 2>&1; then
       printf 'uv\n'

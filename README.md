@@ -1,6 +1,7 @@
 # denv
 
-[![Bash 4.0+](https://img.shields.io/badge/Bash-4.0%2B-blue.svg)](https://www.gnu.org/software/bash/)
+[![CI](https://github.com/E1r0y/denv/actions/workflows/ci.yml/badge.svg)](https://github.com/E1r0y/denv/actions/workflows/ci.yml)
+[![Bash 3.2+](https://img.shields.io/badge/Bash-3.2%2B-blue.svg)](https://www.gnu.org/software/bash/)
 [![direnv](https://img.shields.io/badge/direnv-%3E%3D2.21-purple.svg)](https://direnv.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -72,7 +73,8 @@ denv AoT Architecture:
 
 ## Prerequisites
 
-- **Bash** `>= 4.0`
+- **Operating Systems:** Linux, macOS, WSL (Windows Subsystem for Linux)
+- **Bash** `>= 3.2` (native default on macOS, Linux, and WSL)
 - **[direnv](https://direnv.net/)** `>= 2.21` (hooked into your interactive shell)
 - A Python package manager of your choice (`uv`, `poetry`, `pipenv`, `pdm`, `hatch`, `conda`/`mamba`, `pixi`, or `python3`)
 
@@ -98,7 +100,7 @@ direnv hook fish | source
 Install `denv` directly into `~/.local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mouda/denv/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/E1r0y/denv/main/install.sh | bash
 ```
 
 ### Method 2: Local Installer Script (`install.sh`)
