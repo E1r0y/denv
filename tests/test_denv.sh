@@ -5,7 +5,8 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_DIR="$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SCRIPT_DIR="$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+readonly SCRIPT_DIR
 readonly DENV_BIN="${SCRIPT_DIR}/bin/denv"
 
 tests_run=0
@@ -233,7 +234,7 @@ test_status_command() {
   out="$("$DENV_BIN" status "$tmp")"
   assert_contains "$out" ".env:                present (0 variables)" "Empty .env must report 0 variables cleanly"
   if [[ "$out" == *"(0"$'\n'*"0 variables"* ]]; then
-    echo "Duplicate 0\\n0 newline glitch detected in .env variable count"
+    printf 'Duplicate 0\\n0 newline glitch detected in .env variable count\n'
     return 1
   fi
 }

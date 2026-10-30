@@ -480,7 +480,7 @@ build_activation_snippet() {
     poetry)
       require_cmd poetry
       local raw_poetry_path
-      raw_poetry_path="$(cd -- "$dir" && poetry env info --path 2>/dev/null || true)"
+      raw_poetry_path="$( (cd -- "$dir" && poetry env info --path 2>/dev/null) || true )"
       venv_path="$(printf '%s\n' "$raw_poetry_path" | tail -n 1 | tr -d '\r\n')"
 
       if [[ -z "$venv_path" ]] || [[ ! -d "$venv_path" ]]; then
@@ -491,7 +491,7 @@ build_activation_snippet() {
         fi
         log_info "Initializing Poetry environment..."
         (cd -- "$dir" && poetry env use "${py_version:-python3}" >&2)
-        raw_poetry_path="$(cd -- "$dir" && poetry env info --path 2>/dev/null || true)"
+        raw_poetry_path="$( (cd -- "$dir" && poetry env info --path 2>/dev/null) || true )"
         venv_path="$(printf '%s\n' "$raw_poetry_path" | tail -n 1 | tr -d '\r\n')"
       fi
       ;;
@@ -499,7 +499,7 @@ build_activation_snippet() {
     pipenv)
       require_cmd pipenv
       local raw_pipenv_path
-      raw_pipenv_path="$(cd -- "$dir" && PIPENV_IGNORE_VIRTUALENVS=1 pipenv --venv 2>/dev/null || true)"
+      raw_pipenv_path="$( (cd -- "$dir" && PIPENV_IGNORE_VIRTUALENVS=1 pipenv --venv 2>/dev/null) || true )"
       venv_path="$(printf '%s\n' "$raw_pipenv_path" | tail -n 1 | tr -d '\r\n')"
 
       if [[ -z "$venv_path" ]] || [[ ! -d "$venv_path" ]]; then
@@ -510,7 +510,7 @@ build_activation_snippet() {
         fi
         log_info "Initializing Pipenv environment..."
         (cd -- "$dir" && PIPENV_IGNORE_VIRTUALENVS=1 pipenv --python "${py_version:-python3}" >&2)
-        raw_pipenv_path="$(cd -- "$dir" && PIPENV_IGNORE_VIRTUALENVS=1 pipenv --venv 2>/dev/null || true)"
+        raw_pipenv_path="$( (cd -- "$dir" && PIPENV_IGNORE_VIRTUALENVS=1 pipenv --venv 2>/dev/null) || true )"
         venv_path="$(printf '%s\n' "$raw_pipenv_path" | tail -n 1 | tr -d '\r\n')"
       fi
       ;;
@@ -518,7 +518,7 @@ build_activation_snippet() {
     pdm)
       require_cmd pdm
       local raw_pdm_path
-      raw_pdm_path="$(cd -- "$dir" && pdm info --venv 2>/dev/null || true)"
+      raw_pdm_path="$( (cd -- "$dir" && pdm info --venv 2>/dev/null) || true )"
       venv_path="$(printf '%s\n' "$raw_pdm_path" | tail -n 1 | tr -d '\r\n')"
 
       if [[ -z "$venv_path" ]] || [[ ! -d "$venv_path" ]]; then
@@ -527,7 +527,7 @@ build_activation_snippet() {
         else
           log_info "Creating PDM virtual environment..."
           (cd -- "$dir" && pdm venv create "${py_version:-python3}" >&2)
-          raw_pdm_path="$(cd -- "$dir" && pdm info --venv 2>/dev/null || true)"
+          raw_pdm_path="$( (cd -- "$dir" && pdm info --venv 2>/dev/null) || true )"
           venv_path="$(printf '%s\n' "$raw_pdm_path" | tail -n 1 | tr -d '\r\n')"
         fi
       fi
@@ -536,7 +536,7 @@ build_activation_snippet() {
     hatch)
       require_cmd hatch
       local raw_hatch_path
-      raw_hatch_path="$(cd -- "$dir" && hatch env find default 2>/dev/null || true)"
+      raw_hatch_path="$( (cd -- "$dir" && hatch env find default 2>/dev/null) || true )"
       venv_path="$(printf '%s\n' "$raw_hatch_path" | tail -n 1 | tr -d '\r\n')"
 
       if [[ -z "$venv_path" ]] || [[ ! -d "$venv_path" ]]; then
@@ -546,7 +546,7 @@ build_activation_snippet() {
         fi
         log_info "Creating Hatch 'default' environment..."
         (cd -- "$dir" && hatch env create default >&2)
-        raw_hatch_path="$(cd -- "$dir" && hatch env find default 2>/dev/null || true)"
+        raw_hatch_path="$( (cd -- "$dir" && hatch env find default 2>/dev/null) || true )"
         venv_path="$(printf '%s\n' "$raw_hatch_path" | tail -n 1 | tr -d '\r\n')"
       fi
       ;;

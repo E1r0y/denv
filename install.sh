@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016
 #
 # install.sh - Production-grade installer for denv
 #
@@ -174,7 +175,7 @@ check_direnv_hook() {
 
 find_local_source() {
   local script_dir
-  script_dir="$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P || true)"
+  script_dir="$( (cd -P -- "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || true )"
 
   if [[ -n "$script_dir" ]] && [[ -f "${script_dir}/bin/denv" ]]; then
     printf '%s/bin/denv\n' "$script_dir"
