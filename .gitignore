@@ -1,0 +1,31 @@
+# Environments & direnv artifacts
+.env
+.env.*
+!.env.example
+.envrc
+.envrc.bak
+.envrc.tmp.*
+.denv.lock/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor & OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+

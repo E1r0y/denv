@@ -1,0 +1,79 @@
+# Bash completion for denv
+
+_denv_completions() {
+  local cur prev words cword
+  if declare -F _init_completion >/dev/null 2>&1; then
+    _init_completion || return
+  else
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    words=("${COMP_WORDS[@]}")
+    cword=$COMP_CWORD
+  fi
+
+  local commands="init status clean"
+  local backends="auto uv poetry pipenv pdm hatch conda pixi venv"
+  local init_opts="-b --backend -f --force -n --no-create -g --git-exclude --no-color -h --help -v --version"
+  local status_opts="-q --quiet --no-color -h --help -v --version"
+  local clean_opts="--no-color -h --help -v --version"
+  local global_opts="--no-color -h --help -v --version"
+
+  # Detect subcommand
+  local cmd=""
+  local i
+  for (( i=1; i < cword; i++ )); do
+    case "${words[i]}" in
+      init|status|clean)
+        cmd="${words[i]}"
+        break
+        ;;
+      -b|--backend)
+        ((i++))
+        ;;
+    esac
+  done
+
+  case "$prev" in
+    -b|--backend)
+      COMPREPLY=( $(compgen -W "$backends" -- "$cur") )
+      return 0
+      ;;
+  esac
+
+  if [[ -z "$cmd" ]]; then
+    if [[ "$cur" == -* ]]; then
+      COMPREPLY=( $(compgen -W "$global_opts $init_opts" -- "$cur") )
+      return 0
+    else
+      COMPREPLY=( $(compgen -W "$commands" -- "$cur") $(compgen -d -- "$cur") )
+      return 0
+    fi
+  fi
+
+  case "$cmd" in
+    init)
+      if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$init_opts" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -d -- "$cur") )
+      fi
+      ;;
+    status)
+      if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$status_opts" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -d -- "$cur") )
+      fi
+      ;;
+    clean)
+      if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$clean_opts" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -d -- "$cur") )
+      fi
+      ;;
+  esac
+}
+
+complete -F _denv_completions -o default denv

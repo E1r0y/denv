@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (direnv, shellcheck)
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            brew install direnv shellcheck
+          else
+            sudo apt-get update && sudo apt-get install -y direnv shellcheck
+          fi
+
+      - name: Run syntax checks & integration tests
+        run: make test
+
+      - name: Verify Makefile targets
+        run: |
+          make link PREFIX="$HOME/.local"
+          "$HOME/.local/bin/denv" --version
+          make uninstall PREFIX="$HOME/.local"
+          make install PREFIX="$HOME/.local"
+          "$HOME/.local/bin/denv" --version
+          make uninstall PREFIX="$HOME/.local"
+
+      - name: Verify installer script
+        run: |
+          ./install.sh --version
+          ./install.sh --help
+          ./install.sh --no-color
+          ./install.sh -b "$HOME/.test-bin" -f
+          "$HOME/.test-bin/denv" --version
+          ./install.sh -u -b "$HOME/.test-bin"
+
