@@ -56,10 +56,27 @@ run_test() {
   tmp_dir="$(mktemp -d "/tmp/denv-test.XXXXXXXXXX")"
   local failed=0
 
+  # Start outside a conditional: otherwise Bash disables errexit in every
+  # function called by the test and an early failed assertion can be lost.
   (
+    set -Eeuo pipefail
     cd "$tmp_dir"
+    export HOME="${tmp_dir}/home"
+    export XDG_CONFIG_HOME="${HOME}/.config"
+    export XDG_CACHE_HOME="${HOME}/.cache"
+    export XDG_DATA_HOME="${HOME}/.local/share"
+    export DIRENV_CONFIG="${XDG_CONFIG_HOME}/direnv"
+    export UV_CACHE_DIR="${XDG_CACHE_HOME}/uv"
+    export UV_PYTHON_DOWNLOADS=never
+    export GIT_CONFIG_GLOBAL=/dev/null
+    mkdir -p "$HOME"
     "$test_name" "$tmp_dir"
-  ) || failed=1
+  ) >"${tmp_dir}/test.log" 2>&1 &
+  local test_pid=$!
+  if ! wait "$test_pid"; then
+    failed=1
+    cat "${tmp_dir}/test.log" >&2
+  fi
 
   rm -rf -- "$tmp_dir"
 
@@ -223,6 +240,10 @@ test_status_command() {
   # Initialize directory
   "$DENV_BIN" -n "$tmp" >/dev/null 2>&1
 
+  # A configured workspace is ready only when its environment exists.
+  mkdir -p "${tmp}/.venv/bin"
+  printf '# test activation\n' >"${tmp}/.venv/bin/activate"
+
   # Configured directory: status -q must exit 0
   exit_code=0
   "$DENV_BIN" status -q "$tmp" >/dev/null 2>&1 || exit_code=$?
@@ -231,7 +252,7 @@ test_status_command() {
   # Add empty .env file and check human-readable status output
   touch "${tmp}/.env"
   local out
-  out="$("$DENV_BIN" status "$tmp")"
+  out="$("$DENV_BIN" status "$tmp")" || [[ $? -eq 1 ]]
   assert_contains "$out" ".env:                present (0 variables)" "Empty .env must report 0 variables cleanly"
   if [[ "$out" == *"(0"$'\n'*"0 variables"* ]]; then
     printf 'Duplicate 0\\n0 newline glitch detected in .env variable count\n'
@@ -324,42 +345,42 @@ test_backend_detection_lockfiles() {
 
   # 1. uv.lock
   touch "${tmp}/uv.lock"
-  out="$("$DENV_BIN" status "$tmp")"
+  out="$("$DENV_BIN" status "$tmp")" || [[ $? -eq 1 ]]
   assert_contains "$out" "uv" "Status must detect uv"
   assert_contains "$out" "uv.lock" "Source must be uv.lock"
   rm -f "${tmp}/uv.lock"
 
   # 2. poetry.lock
   touch "${tmp}/poetry.lock"
-  out="$("$DENV_BIN" status "$tmp")"
+  out="$("$DENV_BIN" status "$tmp")" || [[ $? -eq 1 ]]
   assert_contains "$out" "poetry" "Status must detect poetry"
   assert_contains "$out" "poetry.lock" "Source must be poetry.lock"
   rm -f "${tmp}/poetry.lock"
 
   # 3. Pipfile
   touch "${tmp}/Pipfile"
-  out="$("$DENV_BIN" status "$tmp")"
+  out="$("$DENV_BIN" status "$tmp")" || [[ $? -eq 1 ]]
   assert_contains "$out" "pipenv" "Status must detect pipenv"
   assert_contains "$out" "Pipfile" "Source must be Pipfile"
   rm -f "${tmp}/Pipfile"
 
   # 4. pdm.lock
   touch "${tmp}/pdm.lock"
-  out="$("$DENV_BIN" status "$tmp")"
+  out="$("$DENV_BIN" status "$tmp")" || [[ $? -eq 1 ]]
   assert_contains "$out" "pdm" "Status must detect pdm"
   assert_contains "$out" "pdm.lock" "Source must be pdm.lock"
   rm -f "${tmp}/pdm.lock"
 
   # 5. pixi.toml
   touch "${tmp}/pixi.toml"
-  out="$("$DENV_BIN" status "$tmp")"
+  out="$("$DENV_BIN" status "$tmp")" || [[ $? -eq 1 ]]
   assert_contains "$out" "pixi" "Status must detect pixi"
   assert_contains "$out" "pixi.toml" "Source must be pixi.toml"
   rm -f "${tmp}/pixi.toml"
 
   # 6. hatch.toml
   touch "${tmp}/hatch.toml"
-  out="$("$DENV_BIN" status "$tmp")"
+  out="$("$DENV_BIN" status "$tmp")" || [[ $? -eq 1 ]]
   assert_contains "$out" "hatch" "Status must detect hatch"
   assert_contains "$out" "hatch.toml" "Source must be hatch.toml"
   rm -f "${tmp}/hatch.toml"
@@ -370,7 +391,7 @@ name: my-science-env
 channels:
   - conda-forge
 YAML
-  out="$("$DENV_BIN" status "$tmp")"
+  out="$("$DENV_BIN" status "$tmp")" || [[ $? -eq 1 ]]
   assert_contains "$out" "conda" "Status must detect conda"
   assert_contains "$out" "environment.yml" "Source must be environment.yml"
   rm -f "${tmp}/environment.yml"
@@ -386,7 +407,7 @@ test_backend_detection_pyproject() {
 name = "sample-poetry"
 version = "0.1.0"
 TOML
-  out="$("$DENV_BIN" status "$tmp")"
+  out="$("$DENV_BIN" status "$tmp")" || [[ $? -eq 1 ]]
   assert_contains "$out" "poetry" "pyproject tool.poetry must be detected"
   assert_contains "$out" "pyproject.toml" "Source must be pyproject.toml"
 
@@ -395,7 +416,7 @@ TOML
 [tool.pdm]
 version = { source = "scm" }
 TOML
-  out="$("$DENV_BIN" status "$tmp")"
+  out="$("$DENV_BIN" status "$tmp")" || [[ $? -eq 1 ]]
   assert_contains "$out" "pdm" "pyproject tool.pdm must be detected"
 
   # Hatch in pyproject.toml
@@ -403,7 +424,7 @@ TOML
 [tool.hatch.version]
 path = "src/__about__.py"
 TOML
-  out="$("$DENV_BIN" status "$tmp")"
+  out="$("$DENV_BIN" status "$tmp")" || [[ $? -eq 1 ]]
   assert_contains "$out" "hatch" "pyproject tool.hatch must be detected"
 }
 
@@ -411,7 +432,7 @@ test_python_version_resolution() {
   local tmp="$1"
   printf '3.12.2\n' > "${tmp}/.python-version"
   local out
-  out="$("$DENV_BIN" status "$tmp")"
+  out="$("$DENV_BIN" status "$tmp")" || [[ $? -eq 1 ]]
   assert_contains "$out" "Python version:      3.12.2" "Status must display valid .python-version"
 }
 

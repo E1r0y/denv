@@ -7,9 +7,9 @@
 set -Eeuo pipefail
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly VERSION="1.3.0"
+readonly VERSION="1.4.0"
 
-# Standard Exit Codes (sysexits.h)
+# CLI exit codes (77 follows sysexits.h; 2 follows shell usage conventions).
 readonly EX_OK=0
 readonly EX_ERR=1
 readonly EX_USAGE=2
@@ -19,15 +19,22 @@ readonly EX_CMD_NOT_FOUND=127
 readonly VALID_BACKENDS="auto uv poetry pipenv pdm hatch conda pixi venv"
 readonly DENV_START_MARKER="# >>> denv initialize >>>"
 readonly DENV_END_MARKER="# <<< denv initialize <<<"
-readonly LOCK_STALE_MINUTES=10
+readonly MIN_DIRENV_VERSION="2.26.0"
 
 # Internal state variables (strictly lowercase)
 temp_file=""
 lock_dir=""
+lock_acquired=false
+recovery_dir=""
 target_dir=""
 venv_to_cleanup=""
 venv_creation_in_progress=false
 activation_snippet=""
+managed_backend=""
+managed_environment=""
+detected_backend=""
+detected_source=""
+envrc_state="absent"
 
 # --- Terminal Capabilities & Styling ---
 
@@ -94,22 +101,28 @@ cleanup_resources() {
   fi
 
   if [[ "$venv_creation_in_progress" == true ]] && [[ -n "$venv_to_cleanup" ]] && [[ -d "$venv_to_cleanup" ]]; then
-    log_warn "Interrupted during initialization. Purging incomplete environment '${venv_to_cleanup}'..."
+    log_warn "Initialization failed or was interrupted. Removing incomplete environment '${venv_to_cleanup}'..."
     rm -rf -- "$venv_to_cleanup"
     venv_to_cleanup=""
   fi
 
-  if [[ -n "$lock_dir" ]] && [[ -d "$lock_dir" ]]; then
+  if [[ "$lock_acquired" == true ]] && [[ -d "$lock_dir" ]] && [[ ! -L "$lock_dir" ]]; then
     if [[ -f "${lock_dir}/pid" ]]; then
       local lock_pid
       lock_pid="$(cat "${lock_dir}/pid" 2>/dev/null || true)"
       if [[ "$lock_pid" == "$$" ]]; then
-        rm -rf -- "$lock_dir" 2>/dev/null || true
+        rm -f -- "${lock_dir}/pid" 2>/dev/null || true
+        rmdir -- "$lock_dir" 2>/dev/null || true
       fi
     else
       rmdir -- "$lock_dir" 2>/dev/null || true
     fi
     lock_dir=""
+    lock_acquired=false
+  fi
+  if [[ -n "$recovery_dir" ]]; then
+    rmdir -- "$recovery_dir" 2>/dev/null || true
+    recovery_dir=""
   fi
 }
 
@@ -129,7 +142,7 @@ cleanup() {
 
 on_error() {
   local exit_code=$?
-  if [[ -n "${DENV_DEBUG:-}" ]]; then
+  if [[ "${DENV_DEBUG:-0}" == 1 ]]; then
     log_error "Unexpected failure at ${BASH_SOURCE[1]:-unknown}:${BASH_LINENO[0]:-?} (exit code: ${exit_code})."
   fi
 }
@@ -188,6 +201,7 @@ ${b}OPTIONS:${r}
     -f, --force           Regenerate or replace denv block in .envrc
     -n, --no-create       Do not create virtual environment if missing
     -g, --git-exclude     Hide .envrc and local virtual environments in .git/info/exclude
+        --no-allow        Write configuration without authorizing it
         --no-color        Disable ANSI color output
     -h, --help            Print this help message and exit
 
@@ -214,7 +228,7 @@ ${b}USAGE:${r}
     ${SCRIPT_NAME} status [OPTIONS] [TARGET_DIR]
 
 ${b}OPTIONS:${r}
-    -q, --quiet           Suppress output; exit 0 if configured, 1 otherwise
+    -q, --quiet           Exit 0 only if configured, environment exists, and authorized
         --no-color        Disable ANSI color output
     -h, --help            Print this help message and exit
 EOF
@@ -265,41 +279,68 @@ validate_backend() {
 acquire_lock() {
   local dir="$1"
   lock_dir="${dir}/.denv.lock"
-
-  if ! mkdir -- "$lock_dir" 2>/dev/null; then
-    local stale=false
+  if mkdir -- "$lock_dir" 2>/dev/null; then
+    lock_acquired=true
+  else
     local existing_pid=""
-    if [[ -f "${lock_dir}/pid" ]]; then
-      existing_pid="$(cat "${lock_dir}/pid" 2>/dev/null || true)"
-      if [[ -z "$existing_pid" ]] || ! kill -0 "$existing_pid" 2>/dev/null; then
-        stale=true
-      fi
-    else
-      # Lock dir exists without a pid file (interrupted before pid write)
-      stale=true
+    if [[ -L "$lock_dir" || ! -d "$lock_dir" || -L "${lock_dir}/pid" ]]; then
+      log_error "Unsafe workspace lock '${lock_dir}'; refusing to follow or remove it."
+      exit "$EX_NO_PERM"
     fi
-
-    if [[ "$stale" == true ]]; then
-      log_warn "Removing stale workspace lock from PID ${existing_pid:-unknown}."
-      rm -rf -- "$lock_dir"
-      if ! mkdir -- "$lock_dir" 2>/dev/null; then
-        log_error "Failed to acquire lock at '${lock_dir}'."
-        exit "$EX_ERR"
-      fi
-    else
-      # Lock is held by a live process — check age and warn if old
-      if [[ -n "$existing_pid" ]]; then
-        if find "$lock_dir" -maxdepth 0 -mmin +"$LOCK_STALE_MINUTES" -print -quit 2>/dev/null | grep -q .; then
-          log_warn "Lock held by PID ${existing_pid} for over ${LOCK_STALE_MINUTES} minutes (may be stuck)."
-        fi
-      fi
-      log_error "Workspace is currently locked by another denv process (lock: '${lock_dir}')."
-      log_error "If stale, remove '${lock_dir}' and retry."
+    existing_pid="$(cat "${lock_dir}/pid" 2>/dev/null || true)"
+    # No PID can mean that another process has just created the directory.
+    # Never infer staleness from the window before its PID write completes.
+    if [[ ! "$existing_pid" =~ ^[1-9][0-9]*$ ]] || process_is_alive "$existing_pid"; then
+      log_error "Workspace is locked or its lock is still being initialized: '${lock_dir}'."
+      log_error "For an abandoned lock without a PID, verify no denv is running before removing it manually."
       exit "$EX_ERR"
     fi
+    # Serialize stale-lock recovery. A second reaper must never remove the
+    # replacement lock installed by the first. Recheck while holding the guard.
+    if ! mkdir -- "${lock_dir}.recovery" 2>/dev/null; then
+      log_error "Workspace lock recovery is in progress: '${lock_dir}.recovery'."
+      exit "$EX_ERR"
+    fi
+    recovery_dir="${lock_dir}.recovery"
+    local current_pid
+    current_pid="$(cat "${lock_dir}/pid" 2>/dev/null || true)"
+    if [[ "$current_pid" != "$existing_pid" ]] || process_is_alive "$current_pid"; then
+      log_error "Workspace lock changed during recovery; retry."
+      exit "$EX_ERR"
+    fi
+    log_warn "Removing stale workspace lock from PID ${existing_pid}."
+    rm -f -- "${lock_dir}/pid"
+    rmdir -- "$lock_dir" || { log_error "Lock contains unexpected files; inspect it manually."; exit "$EX_ERR"; }
+    if ! mkdir -- "$lock_dir" 2>/dev/null; then
+      log_error "Another process acquired the workspace lock; retry."
+      exit "$EX_ERR"
+    fi
+    lock_acquired=true
   fi
-
   printf '%s\n' "$$" > "${lock_dir}/pid"
+  if [[ -n "$recovery_dir" ]]; then
+    rmdir -- "$recovery_dir"
+    recovery_dir=""
+  fi
+}
+
+process_is_alive() {
+  # kill -0 also fails with EPERM, which does not prove that a PID is dead.
+  kill -0 "$1" 2>/dev/null || ps -p "$1" -o pid= 2>/dev/null | grep -q '[0-9]'
+}
+
+require_direnv() {
+  require_cmd direnv
+  local version major minor
+  version="$(direnv version)"
+  if [[ "$version" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?$ ]]; then
+    major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"
+    if (( major > 2 || (major == 2 && minor >= 26) )); then
+      return 0
+    fi
+  fi
+  log_error "direnv >= ${MIN_DIRENV_VERSION} is required (found '${version}')."
+  exit "$EX_ERR"
 }
 
 resolve_target_dir() {
@@ -313,71 +354,39 @@ resolve_target_dir() {
 
 # --- Detection & Resolution Logic ---
 
-detect_backend() {
+detect_workspace() {
   local dir="$1"
-
-  # 1. Existing local virtual environments take immediate priority
+  detected_backend=""
+  detected_source="fallback"
   if [[ -f "${dir}/.venv/bin/activate" ]] || [[ -f "${dir}/venv/bin/activate" ]]; then
-    printf 'local-existing\n'
-    return 0
-  fi
-
-  # 2. Lockfiles & explicit tool configs
-  if [[ -f "${dir}/uv.lock" ]]; then
-    printf 'uv\n'
-  elif [[ -f "${dir}/poetry.lock" ]]; then
-    printf 'poetry\n'
-  elif [[ -f "${dir}/Pipfile" ]] || [[ -f "${dir}/Pipfile.lock" ]]; then
-    printf 'pipenv\n'
-  elif [[ -f "${dir}/pdm.lock" ]]; then
-    printf 'pdm\n'
-  elif [[ -f "${dir}/pixi.toml" ]] || [[ -f "${dir}/pixi.lock" ]]; then
-    printf 'pixi\n'
-  elif [[ -f "${dir}/hatch.toml" ]]; then
-    printf 'hatch\n'
-  elif [[ -f "${dir}/environment.yml" ]] || [[ -f "${dir}/environment.yaml" ]] || [[ -d "${dir}/.conda" ]]; then
-    printf 'conda\n'
-  elif [[ -f "${dir}/pyproject.toml" ]]; then
-    if grep -Eq '^[[:space:]]*\[tool\.poetry(\]|\.)' "${dir}/pyproject.toml"; then
-      printf 'poetry\n'
-    elif grep -Eq '^[[:space:]]*\[tool\.pdm(\]|\.)' "${dir}/pyproject.toml"; then
-      printf 'pdm\n'
-    elif grep -Eq '^[[:space:]]*\[tool\.hatch(\]|\.)' "${dir}/pyproject.toml"; then
-      printf 'hatch\n'
-    elif command -v uv >/dev/null 2>&1; then
-      printf 'uv\n'
-    else
-      printf 'venv\n'
-    fi
-  elif command -v uv >/dev/null 2>&1; then
-    printf 'uv\n'
-  else
-    printf 'venv\n'
-  fi
-}
-
-detect_backend_source() {
-  local dir="$1"
-  if [[ -f "${dir}/.venv/bin/activate" ]] || [[ -f "${dir}/venv/bin/activate" ]]; then
-    printf 'existing virtualenv\n'
+    detected_backend="local-existing"; detected_source="existing virtualenv"
   elif [[ -f "${dir}/uv.lock" ]]; then
-    printf 'uv.lock\n'
+    detected_backend="uv"; detected_source="uv.lock"
   elif [[ -f "${dir}/poetry.lock" ]]; then
-    printf 'poetry.lock\n'
+    detected_backend="poetry"; detected_source="poetry.lock"
   elif [[ -f "${dir}/Pipfile" ]] || [[ -f "${dir}/Pipfile.lock" ]]; then
-    printf 'Pipfile\n'
+    detected_backend="pipenv"; detected_source="Pipfile / Pipfile.lock"
   elif [[ -f "${dir}/pdm.lock" ]]; then
-    printf 'pdm.lock\n'
-  elif [[ -f "${dir}/pixi.toml" ]] || [[ -f "${dir}/pixi.lock" ]]; then
-    printf 'pixi.toml\n'
+    detected_backend="pdm"; detected_source="pdm.lock"
+  elif [[ -f "${dir}/pixi.toml" || -f "${dir}/pixi.lock" ]] \
+    || { [[ -f "${dir}/pyproject.toml" ]] && grep -Eq '^\[tool\.pixi([.]|\])' "${dir}/pyproject.toml"; }; then
+    detected_backend="pixi"; detected_source="pixi.toml / pixi.lock / pyproject.toml"
   elif [[ -f "${dir}/hatch.toml" ]]; then
-    printf 'hatch.toml\n'
+    detected_backend="hatch"; detected_source="hatch.toml"
   elif [[ -f "${dir}/environment.yml" ]] || [[ -f "${dir}/environment.yaml" ]] || [[ -d "${dir}/.conda" ]]; then
-    printf 'environment.yml\n'
+    detected_backend="conda"; detected_source="environment.yml / environment.yaml / .conda"
   elif [[ -f "${dir}/pyproject.toml" ]]; then
-    printf 'pyproject.toml\n'
-  else
-    printf 'fallback\n'
+    detected_source="pyproject.toml"
+    if grep -Eq '^[[:space:]]*\[tool\.poetry(\]|\.)' "${dir}/pyproject.toml"; then
+      detected_backend="poetry"
+    elif grep -Eq '^[[:space:]]*\[tool\.pdm(\]|\.)' "${dir}/pyproject.toml"; then
+      detected_backend="pdm"
+    elif grep -Eq '^[[:space:]]*\[tool\.hatch(\]|\.)' "${dir}/pyproject.toml"; then
+      detected_backend="hatch"
+    fi
+  fi
+  if [[ -z "$detected_backend" ]]; then
+    if command -v uv >/dev/null 2>&1; then detected_backend="uv"; else detected_backend="venv"; fi
   fi
 }
 
@@ -400,353 +409,296 @@ read_python_version() {
   return 1
 }
 
-build_activation_snippet() {
-  local dir="$1"
-  local backend="$2"
-  local no_create="$3"
-  local venv_path=""
-  local py_version=""
+# Querying an environment must not create it. PDM's selected interpreter is
+# recorded in .pdm-python; querying info on an uninitialized project may select
+# (and create) an interpreter, so use its read-only venv lookup in that case.
+query_venv_path() {
+  local dir="$1" backend="$2" interpreter=""
+  case "$backend" in
+    poetry) (cd -- "$dir" && poetry env info --path) ;;
+    pipenv) (cd -- "$dir" && PIPENV_IGNORE_VIRTUALENVS=1 pipenv --venv) ;;
+    pdm)
+      if [[ -f "${dir}/.pdm-python" ]]; then
+        IFS= read -r interpreter <"${dir}/.pdm-python" || [[ -n "$interpreter" ]]
+        [[ "$interpreter" = /* ]] || return 1
+        dirname -- "$(dirname -- "$interpreter")"
+      else
+        (cd -- "$dir" && pdm venv --path in-project)
+      fi
+      ;;
+    hatch) (cd -- "$dir" && hatch env find default) ;;
+  esac
+}
 
-  activation_snippet=""
-  py_version="$(read_python_version "$dir" || true)"
-
-  if [[ "$backend" == "auto" ]]; then
-    backend="$(detect_backend "$dir")"
-    log_info "Auto-detected environment backend: '${backend}'."
+select_python() {
+  local requested="$1" candidate actual
+  local candidates=(python3)
+  if [[ -n "$requested" ]]; then
+    if [[ ! "$requested" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+      log_error "venv requires a numeric Python version; use uv for '${requested}'."
+      return 1
+    fi
+    candidates=("python${requested}" "python${requested%.*}" python3)
   fi
+  for candidate in "${candidates[@]}"; do
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if [[ -z "$requested" ]]; then printf '%s\n' "$candidate"; return 0; fi
+    actual="$("$candidate" -c 'import platform; print(platform.python_version())' 2>/dev/null)" || continue
+    if [[ "$actual" == "$requested" || "$actual" == "$requested".* ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  log_error "Requested Python '${requested:-3}' is not available. Install it or select the uv backend."
+  return 1
+}
 
+begin_local_creation() {
+  venv_to_cleanup=""
+  if [[ ! -e "$1" && ! -L "$1" ]]; then venv_to_cleanup="$1"; fi
+  venv_creation_in_progress=true
+}
+
+finish_local_creation() {
+  venv_creation_in_progress=false
+  venv_to_cleanup=""
+}
+
+build_activation_snippet() {
+  local dir="$1" backend="$2" no_create="$3"
+  local venv_path="" py_version=""
+  activation_snippet=""
+  managed_environment=""
+  py_version="$(read_python_version "$dir" || true)"
+  if [[ "$backend" == auto ]]; then
+    detect_workspace "$dir"
+    backend="$detected_backend"
+    log_info "Auto-detected environment backend: '${backend}' (${detected_source})."
+  fi
+  managed_backend="$backend"
   case "$backend" in
     local-existing)
-      if [[ -f "${dir}/.venv/bin/activate" ]]; then
-        venv_path="${dir}/.venv"
-      else
-        venv_path="${dir}/venv"
-      fi
+      if [[ -f "${dir}/.venv/bin/activate" ]]; then venv_path="${dir}/.venv"; else venv_path="${dir}/venv"; fi
       ;;
-
-    uv)
-      require_cmd uv
+    uv|venv)
       venv_path="${dir}/.venv"
       if [[ ! -f "${venv_path}/bin/activate" ]]; then
         if [[ "$no_create" == true ]]; then
-          log_warn "Skipping 'uv' environment creation (--no-create)."
+          log_warn "Environment is missing; writing a pending configuration (--no-create)."
         else
-          local pre_existing=false
-          [[ -e "$venv_path" ]] && pre_existing=true
-
-          log_info "Creating virtual environment at '${venv_path}' via 'uv'..."
-          [[ "$pre_existing" == false ]] && venv_to_cleanup="$venv_path"
-          venv_creation_in_progress=true
-
-          if [[ -n "$py_version" ]]; then
-            (cd -- "$dir" && uv venv --python "$py_version" "$venv_path" >&2)
+          begin_local_creation "$venv_path"
+          log_info "Creating '${venv_path}' with ${backend}..."
+          if [[ "$backend" == uv ]]; then
+            require_cmd uv
+            if [[ -n "$py_version" ]]; then
+              (cd -- "$dir" && uv venv --python "$py_version" "$venv_path" >&2) || exit "$?"
+            else
+              (cd -- "$dir" && uv venv "$venv_path" >&2) || exit "$?"
+            fi
           else
-            (cd -- "$dir" && uv venv "$venv_path" >&2)
+            local py_bin
+            py_bin="$(select_python "$py_version")"
+            (cd -- "$dir" && "$py_bin" -m venv "$venv_path" >&2) || exit "$?"
           fi
-
-          venv_creation_in_progress=false
-          venv_to_cleanup=""
+          [[ -f "${venv_path}/bin/activate" ]] || { log_error "${backend} did not create a usable virtual environment."; exit "$EX_ERR"; }
+          finish_local_creation
         fi
       fi
       ;;
-
-    venv)
-      local py_bin="python3"
-      if [[ -n "$py_version" ]] && command -v "python${py_version}" >/dev/null 2>&1; then
-        py_bin="python${py_version}"
-      else
-        require_cmd python3
-      fi
-      venv_path="${dir}/.venv"
-      if [[ ! -f "${venv_path}/bin/activate" ]]; then
+    poetry|pipenv|pdm|hatch)
+      require_cmd "$backend"
+      venv_path="$(query_venv_path "$dir" "$backend" 2>/dev/null || true)"
+      if [[ "$venv_path" != /* || ! -f "${venv_path}/bin/activate" ]]; then
         if [[ "$no_create" == true ]]; then
-          log_warn "Skipping 'venv' environment creation (--no-create)."
-        else
-          local pre_existing=false
-          [[ -e "$venv_path" ]] && pre_existing=true
-
-          log_info "Creating virtual environment at '${venv_path}' via '${py_bin} -m venv'..."
-          [[ "$pre_existing" == false ]] && venv_to_cleanup="$venv_path"
-          venv_creation_in_progress=true
-
-          (cd -- "$dir" && "$py_bin" -m venv "$venv_path" >&2)
-
-          venv_creation_in_progress=false
-          venv_to_cleanup=""
-        fi
-      fi
-      ;;
-
-    poetry)
-      require_cmd poetry
-      local raw_poetry_path
-      raw_poetry_path="$( (cd -- "$dir" && poetry env info --path 2>/dev/null) || true )"
-      venv_path="$(printf '%s\n' "$raw_poetry_path" | tail -n 1 | tr -d '\r\n')"
-
-      if [[ -z "$venv_path" ]] || [[ ! -d "$venv_path" ]]; then
-        if [[ "$no_create" == true ]]; then
-          log_warn "Poetry environment uninitialized; falling back to dynamic 'layout poetry'."
-          activation_snippet="layout poetry"
-          return 0
-        fi
-        log_info "Initializing Poetry environment..."
-        (cd -- "$dir" && poetry env use "${py_version:-python3}" >&2)
-        raw_poetry_path="$( (cd -- "$dir" && poetry env info --path 2>/dev/null) || true )"
-        venv_path="$(printf '%s\n' "$raw_poetry_path" | tail -n 1 | tr -d '\r\n')"
-      fi
-      ;;
-
-    pipenv)
-      require_cmd pipenv
-      local raw_pipenv_path
-      raw_pipenv_path="$( (cd -- "$dir" && PIPENV_IGNORE_VIRTUALENVS=1 pipenv --venv 2>/dev/null) || true )"
-      venv_path="$(printf '%s\n' "$raw_pipenv_path" | tail -n 1 | tr -d '\r\n')"
-
-      if [[ -z "$venv_path" ]] || [[ ! -d "$venv_path" ]]; then
-        if [[ "$no_create" == true ]]; then
-          log_warn "Pipenv environment uninitialized; falling back to dynamic 'layout pipenv'."
-          activation_snippet="layout pipenv"
-          return 0
-        fi
-        log_info "Initializing Pipenv environment..."
-        (cd -- "$dir" && PIPENV_IGNORE_VIRTUALENVS=1 pipenv --python "${py_version:-python3}" >&2)
-        raw_pipenv_path="$( (cd -- "$dir" && PIPENV_IGNORE_VIRTUALENVS=1 pipenv --venv 2>/dev/null) || true )"
-        venv_path="$(printf '%s\n' "$raw_pipenv_path" | tail -n 1 | tr -d '\r\n')"
-      fi
-      ;;
-
-    pdm)
-      require_cmd pdm
-      local raw_pdm_path
-      raw_pdm_path="$( (cd -- "$dir" && pdm info --venv 2>/dev/null) || true )"
-      venv_path="$(printf '%s\n' "$raw_pdm_path" | tail -n 1 | tr -d '\r\n')"
-
-      if [[ -z "$venv_path" ]] || [[ ! -d "$venv_path" ]]; then
-        if [[ "$no_create" == true ]]; then
-          venv_path="${dir}/.venv"
-        else
-          log_info "Creating PDM virtual environment..."
-          (cd -- "$dir" && pdm venv create "${py_version:-python3}" >&2)
-          raw_pdm_path="$( (cd -- "$dir" && pdm info --venv 2>/dev/null) || true )"
-          venv_path="$(printf '%s\n' "$raw_pdm_path" | tail -n 1 | tr -d '\r\n')"
-        fi
-      fi
-      ;;
-
-    hatch)
-      require_cmd hatch
-      local raw_hatch_path
-      raw_hatch_path="$( (cd -- "$dir" && hatch env find default 2>/dev/null) || true )"
-      venv_path="$(printf '%s\n' "$raw_hatch_path" | tail -n 1 | tr -d '\r\n')"
-
-      if [[ -z "$venv_path" ]] || [[ ! -d "$venv_path" ]]; then
-        if [[ "$no_create" == true ]]; then
-          log_error "Hatch default environment missing and --no-create was specified."
+          log_error "No usable ${backend} environment found; --no-create prevents initialization."
           exit "$EX_ERR"
         fi
-        log_info "Creating Hatch 'default' environment..."
-        (cd -- "$dir" && hatch env create default >&2)
-        raw_hatch_path="$( (cd -- "$dir" && hatch env find default 2>/dev/null) || true )"
-        venv_path="$(printf '%s\n' "$raw_hatch_path" | tail -n 1 | tr -d '\r\n')"
-      fi
-      ;;
-
-    pixi)
-      require_cmd pixi
-      if [[ "$no_create" == false ]] && [[ ! -d "${dir}/.pixi" ]]; then
-        log_info "Initializing Pixi environment..."
-        (cd -- "$dir" && pixi install >&2)
-      fi
-      activation_snippet=$(cat <<'SNIPPET'
-watch_file pixi.lock
-eval "$(pixi shell-hook --shell bash)"
-SNIPPET
-)
-      return 0
-      ;;
-
-    conda)
-      local conda_bin=""
-      if command -v micromamba >/dev/null 2>&1; then
-        conda_bin="micromamba"
-      elif command -v mamba >/dev/null 2>&1; then
-        conda_bin="mamba"
-      elif command -v conda >/dev/null 2>&1; then
-        conda_bin="conda"
-      else
-        log_error "Neither 'micromamba', 'mamba', nor 'conda' found in PATH."
-        exit "$EX_CMD_NOT_FOUND"
-      fi
-
-      local conda_target="${dir}/.conda"
-      local env_file=""
-      if [[ -f "${dir}/environment.yml" ]]; then
-        env_file="${dir}/environment.yml"
-      elif [[ -f "${dir}/environment.yaml" ]]; then
-        env_file="${dir}/environment.yaml"
-      fi
-
-      if [[ -n "$env_file" ]]; then
-        local raw_name
-        raw_name="$(awk -F: '/^[[:space:]]*name[[:space:]]*:/ {
-          sub(/[[:space:]]*#.*$/, "", $2);
-          gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);
-          gsub(/^["\x27]|["\x27]$/, "", $2);
-          print $2;
-          exit
-        }' "$env_file")"
-        if [[ -n "$raw_name" ]]; then
-          if [[ "$raw_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
-            conda_target="$raw_name"
-          else
-            log_warn "Conda environment name '${raw_name}' in '${env_file}' contains invalid characters."
-          fi
+        log_info "Initializing ${backend} environment..."
+        case "$backend" in
+          poetry) (cd -- "$dir" && poetry env use "${py_version:-python3}" >&2) || exit "$?" ;;
+          pipenv) (cd -- "$dir" && PIPENV_IGNORE_VIRTUALENVS=1 pipenv --python "${py_version:-python3}" >&2) || exit "$?" ;;
+          pdm) (cd -- "$dir" && pdm venv create "${py_version:-python3}" >&2) || exit "$?" ;;
+          hatch) (cd -- "$dir" && hatch env create default >&2) || exit "$?" ;;
+        esac
+        venv_path="$(query_venv_path "$dir" "$backend" 2>/dev/null || true)"
+        if [[ "$backend" == pdm && ! -f "${venv_path}/bin/activate" ]]; then
+          local interpreter
+          interpreter="$(cd -- "$dir" && pdm info --python)"
+          venv_path="$(dirname -- "$(dirname -- "$interpreter")")"
+        fi
+        if [[ "$venv_path" != /* || ! -f "${venv_path}/bin/activate" ]]; then
+          log_error "${backend} did not return a usable virtual environment path."
+          exit "$EX_ERR"
         fi
       fi
-
-      local safe_bin safe_target
-      safe_bin="$(printf '%q' "$conda_bin")"
-      safe_target="$(printf '%q' "$conda_target")"
-
-      activation_snippet=$(cat <<SNIPPET
-eval "\$(${safe_bin} shell hook --shell bash 2>/dev/null || ${safe_bin} shell.bash hook)"
-${safe_bin} activate ${safe_target}
-SNIPPET
-)
+      ;;
+    pixi)
+      require_cmd pixi
+      managed_environment="${dir}/.pixi/envs/default"
+      if [[ "$no_create" == false ]]; then
+        (cd -- "$dir" && pixi install >&2) || exit "$?"
+      elif [[ ! -d "${managed_environment}/conda-meta" ]]; then
+        log_error "Pixi default environment is missing and --no-create was specified."
+        exit "$EX_ERR"
+      fi
+      # Capture the hook once, with both installation and lock updates disabled.
+      # Changing directories must never install dependencies or launch Pixi.
+      local pixi_hook
+      pixi_hook="$(cd -- "$dir" && pixi shell-hook --shell bash --frozen --no-install)" || exit "$?"
+      [[ -n "$pixi_hook" && -d "${managed_environment}/conda-meta" ]] || { log_error "Pixi did not produce a usable default environment."; exit "$EX_ERR"; }
+      activation_snippet="watch_file pixi.toml pyproject.toml pixi.lock
+${pixi_hook}"
       return 0
       ;;
-
-    *)
-      log_error "Unsupported backend '${backend}'. Choose from: ${VALID_BACKENDS// /, }."
-      exit "$EX_USAGE"
+    conda)
+      local conda_bin="" env_file=""
+      if command -v micromamba >/dev/null 2>&1; then conda_bin=micromamba
+      elif command -v mamba >/dev/null 2>&1; then conda_bin=mamba
+      else require_cmd conda; conda_bin=conda; fi
+      managed_environment="${dir}/.conda"
+      if [[ ! -d "${managed_environment}/conda-meta" ]]; then
+        if [[ "$no_create" == true ]]; then
+          log_error "Local Conda environment is missing and --no-create was specified."
+          exit "$EX_ERR"
+        fi
+        if [[ -f "${dir}/environment.yml" ]]; then env_file="${dir}/environment.yml"
+        elif [[ -f "${dir}/environment.yaml" ]]; then env_file="${dir}/environment.yaml"
+        else log_error "Conda requires environment.yml, environment.yaml, or an existing .conda environment."; exit "$EX_ERR"; fi
+        begin_local_creation "$managed_environment"
+        if [[ "$conda_bin" == micromamba ]]; then
+          (cd -- "$dir" && "$conda_bin" create --yes --prefix "$managed_environment" --file "$env_file" >&2) || exit "$?"
+        else
+          (cd -- "$dir" && "$conda_bin" env create --yes --prefix "$managed_environment" --file "$env_file" >&2) || exit "$?"
+        fi
+        [[ -d "${managed_environment}/conda-meta" ]] || { log_error "Conda did not create a usable environment."; exit "$EX_ERR"; }
+        finish_local_creation
+      fi
+      local safe_bin safe_target
+      safe_bin="$(printf '%q' "$conda_bin")"
+      safe_target="$(printf '%q' "$managed_environment")"
+      activation_snippet="watch_file environment.yml environment.yaml
+_denv_conda_hook=\"\$(${safe_bin} shell hook --shell bash 2>/dev/null || ${safe_bin} shell.bash hook)\" || return 1
+eval \"\$_denv_conda_hook\"
+unset _denv_conda_hook
+${safe_bin} activate ${safe_target}"
+      return 0
       ;;
+    *) log_error "Unsupported backend '${backend}'."; exit "$EX_USAGE" ;;
   esac
-
-  if [[ -z "$venv_path" ]]; then
-    log_error "Failed to resolve virtual environment path for backend '${backend}'."
-    exit "$EX_ERR"
-  fi
-
-  local act_script="${venv_path}/bin/activate"
-  local safe_act
-  safe_act="$(printf '%q' "$act_script")"
-
-  # Support in-tree relative fallback for portable workspace movement
-  if [[ "$venv_path" == "${dir}/.venv" ]]; then
-    activation_snippet=$(cat <<SNIPPET
-if [[ -f .venv/bin/activate ]]; then
-  source .venv/bin/activate
+  managed_environment="$venv_path"
+  local safe_act relative_act=""
+  safe_act="$(printf '%q' "${venv_path}/bin/activate")"
+  case "$venv_path" in
+    "${dir}/.venv") relative_act=".venv/bin/activate" ;;
+    "${dir}/venv") relative_act="venv/bin/activate" ;;
+  esac
+  if [[ -n "$relative_act" ]]; then
+    activation_snippet="if [[ -f ${relative_act} ]]; then
+  source ${relative_act}
 elif [[ -f ${safe_act} ]]; then
   source ${safe_act}
-fi
-SNIPPET
-)
-  elif [[ "$venv_path" == "${dir}/venv" ]]; then
-    activation_snippet=$(cat <<SNIPPET
-if [[ -f venv/bin/activate ]]; then
-  source venv/bin/activate
-elif [[ -f ${safe_act} ]]; then
-  source ${safe_act}
-fi
-SNIPPET
-)
+else
+  log_error 'Virtual environment is missing; run denv init --force.'
+  return 1
+fi"
   else
-    activation_snippet=$(cat <<SNIPPET
-if [[ -f ${safe_act} ]]; then
+    activation_snippet="if [[ -f ${safe_act} ]]; then
   source ${safe_act}
-fi
-SNIPPET
-)
+else
+  log_error 'Virtual environment is missing; run denv init --force.'
+  return 1
+fi"
   fi
 }
 
 # --- Atomic File Operations ---
 
-apply_to_envrc() {
-  local envrc_file="$1"
-  local snippet="$2"
-  local workspace_dir="$3"
-  local force="$4"
+# Inspect markers once before any backend or file operation. CRLF markers are
+# accepted, while duplicates, orphaned ends and nested/incomplete blocks fail.
+inspect_envrc() {
+  local file="$1"
+  if [[ -L "$file" || ( -e "$file" && ! -f "$file" ) ]]; then
+    envrc_state=unsafe
+  elif [[ ! -e "$file" ]]; then
+    envrc_state=absent
+  else
+    envrc_state="$(awk -v start="$DENV_START_MARKER" -v end="$DENV_END_MARKER" '
+      { line=$0; sub(/\r$/, "", line) }
+      line == start { if (opened || count) bad=1; opened=1; count++; next }
+      line == end { if (!opened) bad=1; opened=0; next }
+      index(line, start) || index(line, end) { bad=1 }
+      END { if (bad || opened) print "invalid"; else if (count) print "managed"; else print "custom" }
+    ' "$file")" || return 1
+  fi
+}
 
-  local full_block
-  full_block=$(cat <<BLOCK
-${DENV_START_MARKER}
+validate_envrc_for_write() {
+  inspect_envrc "$1"
+  case "$envrc_state" in
+    unsafe) log_error "Refusing to operate on symlinked or non-regular '$1'."; exit "$EX_NO_PERM" ;;
+    invalid) log_error "Invalid denv markers in '$1'. Repair the block before retrying; file left unchanged."; exit "$EX_ERR" ;;
+  esac
+}
+
+preserve_file_mode() {
+  local original="$1" replacement="$2" mode
+  mode="$(stat -c '%a' "$original" 2>/dev/null || stat -f '%Lp' "$original")" || return 1
+  chmod "$mode" "$replacement"
+}
+
+apply_to_envrc() {
+  local envrc_file="$1" snippet="$2" workspace_dir="$3" force="$4"
+  local full_block environment_hex
+  if [[ "$envrc_state" == managed && "$force" == false ]]; then return 0; fi
+  environment_hex="$(printf '%s' "$managed_environment" | od -An -tx1 | tr -d ' \n')"
+  full_block="${DENV_START_MARKER}
 # Managed by denv v${VERSION}
+# denv backend: ${managed_backend}
+# denv environment: ${environment_hex}
 watch_file .env
 dotenv_if_exists .env
 ${snippet}
-${DENV_END_MARKER}
-BLOCK
-)
-
-  temp_file="$(mktemp "${workspace_dir}/.envrc.tmp.XXXXXXXXXX")"
-
-  if [[ ! -e "$envrc_file" ]]; then
-    printf '%s\n' "$full_block" > "$temp_file"
-    mv -f -- "$temp_file" "$envrc_file"
-    temp_file=""
-    log_success "Created '${envrc_file}'."
-    return 0
-  fi
-
-  # Check if managed denv block is already present
-  if grep -Fq "$DENV_START_MARKER" "$envrc_file" 2>/dev/null; then
-    if [[ "$force" == true ]]; then
-      DENV_REPL="$full_block" awk -v start="$DENV_START_MARKER" -v end="$DENV_END_MARKER" '
-        $0 == start { print ENVIRON["DENV_REPL"]; skip=1; next }
-        $0 == end   { skip=0; next }
-        !skip       { print }
-      ' "$envrc_file" > "$temp_file"
-      mv -f -- "$temp_file" "$envrc_file"
-      temp_file=""
-      log_success "Updated existing denv block in '${envrc_file}'."
-    else
-      log_info "Workspace is already configured by denv in '${envrc_file}' (use --force to update)."
-      rm -f -- "$temp_file"
-      temp_file=""
+${DENV_END_MARKER}"
+  temp_file="$(mktemp "${workspace_dir}/.envrc.tmp.XXXXXXXXXX")" || return 1
+  if [[ "$envrc_state" == absent ]]; then
+    printf '%s\n' "$full_block" >"$temp_file" || return 1
+  elif [[ "$envrc_state" == managed ]]; then
+    DENV_REPL="$full_block" awk -v start="$DENV_START_MARKER" -v end="$DENV_END_MARKER" '
+      { line=$0; sub(/\r$/, "", line) }
+      line == start { print ENVIRON["DENV_REPL"]; skip=1; next }
+      line == end { skip=0; next }
+      !skip { print }
+    ' "$envrc_file" >"$temp_file" || return 1
+  else
+    cat -- "$envrc_file" >"$temp_file" || return 1
+    if [[ -s "$temp_file" && -n "$(tail -c 1 "$temp_file")" ]]; then
+      printf '\n' >>"$temp_file" || return 1
     fi
-    return 0
+    printf '%s\n' "$full_block" >>"$temp_file" || return 1
   fi
-
-  # Append block non-destructively to existing .envrc
-  cp -p -- "$envrc_file" "$temp_file"
-  if [[ -s "$temp_file" && -n "$(tail -c 1 "$temp_file")" ]]; then
-    printf '\n' >> "$temp_file"
-  fi
-  printf '%s\n' "$full_block" >> "$temp_file"
-
-  mv -f -- "$temp_file" "$envrc_file"
+  if [[ -f "$envrc_file" ]]; then preserve_file_mode "$envrc_file" "$temp_file" || return 1; fi
+  mv -f -- "$temp_file" "$envrc_file" || return 1
   temp_file=""
-  log_success "Appended denv block to '${envrc_file}'."
+  log_success "Wrote denv configuration to '${envrc_file}'."
 }
 
 remove_denv_block() {
-  local envrc_file="$1"
-
-  if ! grep -Fq "$DENV_START_MARKER" "$envrc_file" 2>/dev/null; then
-    return 1
-  fi
-
-  local workspace_dir
-  workspace_dir="$(dirname -- "$envrc_file")"
-  temp_file="$(mktemp "${workspace_dir}/.envrc.tmp.XXXXXXXXXX")"
-
+  local envrc_file="$1" workspace_dir
+  workspace_dir="$(dirname -- "$envrc_file")" || return 1
+  temp_file="$(mktemp "${workspace_dir}/.envrc.tmp.XXXXXXXXXX")" || return 1
   awk -v start="$DENV_START_MARKER" -v end="$DENV_END_MARKER" '
-    $0 == start { skip=1; next }
-    $0 == end   { skip=0; next }
-    !skip       { print }
-  ' "$envrc_file" > "$temp_file"
-
-  # If remaining file is empty or whitespace-only, delete it entirely
-  if [[ ! -s "$temp_file" ]] || ! grep -q '[^[:space:]]' "$temp_file" 2>/dev/null; then
-    rm -f -- "$temp_file" "$envrc_file"
-    temp_file=""
-    return 0
+    { line=$0; sub(/\r$/, "", line) }
+    line == start { skip=1; next }
+    line == end { skip=0; next }
+    !skip { print }
+  ' "$envrc_file" >"$temp_file" || return 1
+  if [[ ! -s "$temp_file" ]] || ! grep -q '[^[:space:]]' "$temp_file"; then
+    rm -f -- "$temp_file" "$envrc_file" || return 1
+  else
+    preserve_file_mode "$envrc_file" "$temp_file" || return 1
+    mv -f -- "$temp_file" "$envrc_file" || return 1
   fi
-
-  mv -f -- "$temp_file" "$envrc_file"
   temp_file=""
-  return 0
 }
 
 exclude_in_git() {
@@ -786,7 +738,7 @@ exclude_in_git() {
         printf '\n' >> "$exclude_file"
       fi
       local pattern
-      for pattern in ".envrc" ".envrc.bak" ".envrc.tmp.*" ".denv.lock/" ".venv/" "venv/"; do
+      for pattern in ".env" ".env.*" "!.env.example" ".envrc" ".envrc.bak" ".envrc.tmp.*" ".denv.lock/" ".denv.lock.recovery/" ".venv/" "venv/" ".conda/" ".pixi/"; do
         if ! grep -Fxq "$pattern" "$exclude_file" 2>/dev/null; then
           printf '%s\n' "$pattern" >> "$exclude_file"
         fi
@@ -799,407 +751,199 @@ exclude_in_git() {
   log_warn "Git info/exclude is not writable; skipping --git-exclude."
 }
 
-# --- Subcommand: init ---
+# --- CLI commands ---
 
-cmd_init() {
-  local force=false
-  local no_create=false
-  local git_exclude=false
-  local backend="auto"
-  local raw_target=""
+# One parser defines shared options, target handling and -- semantics for all
+# commands. Command implementations receive state rather than reparse argv.
+cli_target="."
+cli_backend=auto
+cli_force=false
+cli_no_create=false
+cli_git_exclude=false
+cli_no_allow=false
+cli_quiet=false
 
+parse_options() {
+  local command="$1" target_seen=false
+  shift
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --no-color) init_colors never; shift ;;
+      -h|--help) "usage_${command}"; exit "$EX_OK" ;;
+      -v|--version) printf '%s version %s\n' "$SCRIPT_NAME" "$VERSION"; exit "$EX_OK" ;;
       -b|--backend)
-        [[ $# -lt 2 ]] && { log_error "Option '$1' requires an argument."; exit "$EX_USAGE"; }
-        backend="$2"
-        shift 2
-        ;;
-      -f|--force)
-        force=true
-        shift
-        ;;
-      -n|--no-create)
-        no_create=true
-        shift
-        ;;
-      -g|--git-exclude)
-        git_exclude=true
-        shift
-        ;;
-      -h|--help)
-        usage_init "stdout"
-        exit "$EX_OK"
-        ;;
-      -v|--version)
-        printf '%s version %s\n' "$SCRIPT_NAME" "$VERSION"
-        exit "$EX_OK"
-        ;;
-      --)
-        shift
-        break
-        ;;
-      -*)
-        log_error "Unknown option: $1"
-        usage_init "stderr" >&2
-        exit "$EX_USAGE"
-        ;;
+        [[ "$command" == init && $# -ge 2 && -n "$2" && "$2" != -* ]] || { log_error "Option '$1' requires a backend for init."; exit "$EX_USAGE"; }
+        cli_backend="$2"; shift 2 ;;
+      -f|--force|-n|--no-create|-g|--git-exclude|--no-allow)
+        [[ "$command" == init ]] || { log_error "Option '$1' is only valid for init."; exit "$EX_USAGE"; }
+        case "$1" in
+          -f|--force) cli_force=true ;;
+          -n|--no-create) cli_no_create=true ;;
+          -g|--git-exclude) cli_git_exclude=true ;;
+          --no-allow) cli_no_allow=true ;;
+        esac
+        shift ;;
+      -q|--quiet)
+        [[ "$command" == status ]] || { log_error "Option '$1' is only valid for status."; exit "$EX_USAGE"; }
+        cli_quiet=true; shift ;;
+      --) shift; break ;;
+      -*) log_error "Unknown option for '${command}': $1"; exit "$EX_USAGE" ;;
       *)
-        if [[ -z "$raw_target" ]]; then
-          raw_target="$1"
-          shift
-        else
-          log_error "Unexpected positional argument: $1"
-          usage_init "stderr" >&2
-          exit "$EX_USAGE"
-        fi
-        ;;
+        [[ "$target_seen" == false ]] || { log_error "Unexpected argument: $1"; exit "$EX_USAGE"; }
+        cli_target="$1"; target_seen=true; shift ;;
     esac
   done
+  if [[ $# -gt 0 && "$target_seen" == false ]]; then cli_target="$1"; shift; fi
+  [[ $# -eq 0 ]] || { log_error "Unexpected positional argument: $1"; exit "$EX_USAGE"; }
+}
 
-  if [[ $# -gt 0 ]] && [[ -z "$raw_target" ]]; then
-    raw_target="$1"
-    shift
-  fi
-
-  if [[ $# -gt 0 ]]; then
-    log_error "Unexpected positional argument: $1"
-    usage_init "stderr" >&2
-    exit "$EX_USAGE"
-  fi
-
-  # Validate backend early
-  validate_backend "$backend"
-
-  # Resolve target directory
-  target_dir="$(resolve_target_dir "${raw_target:-.}")"
-
+validate_writable_workspace() {
   if [[ ! -w "$target_dir" ]]; then
     log_error "Target directory '${target_dir}' is not writable."
     exit "$EX_NO_PERM"
   fi
-
-  # Prevent accidental execution as root
-  if [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ "${DENV_ALLOW_ROOT:-0}" != "1" ]]; then
+  if [[ "${EUID:-$(id -u)}" -eq 0 && "${DENV_ALLOW_ROOT:-0}" != 1 ]]; then
     log_error "Refusing to run as root (set DENV_ALLOW_ROOT=1 to override)."
     exit "$EX_NO_PERM"
   fi
-
-  require_cmd direnv
-
-  local envrc_file="${target_dir}/.envrc"
-  if [[ -L "$envrc_file" ]]; then
-    log_error "Refusing to operate on symlinked '${envrc_file}'."
-    exit "$EX_NO_PERM"
-  fi
-
-  # Acquire workspace mutex lock
-  acquire_lock "$target_dir"
-
-  # Build configuration
-  build_activation_snippet "$target_dir" "$backend" "$no_create"
-
-  # Write configuration atomically
-  apply_to_envrc "$envrc_file" "$activation_snippet" "$target_dir" "$force"
-
-  if [[ "$git_exclude" == true ]]; then
-    exclude_in_git "$target_dir"
-  fi
-
-  # Grant authorization via direnv
-  direnv allow "$envrc_file"
-  log_success "Workspace authorized via 'direnv allow'."
 }
 
-# --- Subcommand: status ---
+authorize_workspace() {
+  if [[ "$cli_no_allow" == false ]]; then
+    direnv allow "${target_dir}/.envrc"
+    log_success "Workspace authorized via 'direnv allow'."
+  else
+    log_info "Configuration written without authorization (--no-allow); review .envrc, then run direnv allow."
+  fi
+}
+
+cmd_init() {
+  validate_backend "$cli_backend"
+  validate_writable_workspace
+  require_direnv
+  acquire_lock "$target_dir"
+  local envrc_file="${target_dir}/.envrc"
+  validate_envrc_for_write "$envrc_file"
+  if [[ "$envrc_state" == managed && "$cli_force" == false ]]; then
+    log_info "Workspace is already configured (use --force to regenerate)."
+  else
+    build_activation_snippet "$target_dir" "$cli_backend" "$cli_no_create"
+    apply_to_envrc "$envrc_file" "$activation_snippet" "$target_dir" "$cli_force"
+  fi
+  if [[ "$cli_git_exclude" == true ]]; then exclude_in_git "$target_dir"; fi
+  authorize_workspace
+}
+
+# Decode only validated hexadecimal metadata, never eval shell code from .envrc.
+read_managed_metadata() {
+  local file="$1" field="$2"
+  awk -v start="$DENV_START_MARKER" -v end="$DENV_END_MARKER" -v prefix="# denv ${field}: " '
+    { line=$0; sub(/\r$/, "", line) }
+    line == start { inside=1; next }
+    line == end { inside=0 }
+    inside && index(line, prefix) == 1 { print substr(line, length(prefix)+1); exit }
+  ' "$file"
+}
+
+decode_environment() {
+  local hex="$1" escaped=""
+  [[ -n "$hex" && "$hex" != *[!0-9a-f]* && $((${#hex} % 2)) == 0 ]] || return 1
+  while [[ -n "$hex" ]]; do
+    [[ "${hex:0:2}" != 00 ]] || return 1
+    escaped="${escaped}\\x${hex:0:2}"
+    hex="${hex:2}"
+  done
+  printf '%b' "$escaped"
+}
+
+workspace_is_authorized() {
+  command -v direnv >/dev/null 2>&1 || return 1
+  (cd -- "$1" && LC_ALL=C direnv status) 2>/dev/null | grep -Eq '^Found RC allowed (true|0)$'
+}
 
 cmd_status() {
-  local raw_target=""
-  local quiet=false
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -q|--quiet)
-        quiet=true
-        shift
-        ;;
-      -h|--help)
-        usage_status
-        exit "$EX_OK"
-        ;;
-      -v|--version)
-        printf '%s version %s\n' "$SCRIPT_NAME" "$VERSION"
-        exit "$EX_OK"
-        ;;
-      --)
-        shift
-        break
-        ;;
-      -*)
-        log_error "Unknown option for 'status': $1"
-        exit "$EX_USAGE"
-        ;;
-      *)
-        if [[ -z "$raw_target" ]]; then
-          raw_target="$1"
-          shift
-        else
-          log_error "Unexpected argument: $1"
-          exit "$EX_USAGE"
-        fi
-        ;;
+  local envrc_file="${target_dir}/.envrc" ready=false authorized=false
+  local backend="unknown" environment="" source="configuration" environment_state="not found"
+  inspect_envrc "$envrc_file"
+  if [[ "$envrc_state" == managed ]]; then
+    backend="$(read_managed_metadata "$envrc_file" backend)"
+    environment="$(decode_environment "$(read_managed_metadata "$envrc_file" environment)" || true)"
+    # Local environments retain a relative fallback when the workspace moves.
+    case "$backend" in
+      uv|venv|local-existing)
+        if [[ -f "${target_dir}/.venv/bin/activate" ]]; then environment="${target_dir}/.venv"
+        elif [[ -f "${target_dir}/venv/bin/activate" && "$backend" == local-existing ]]; then environment="${target_dir}/venv"; fi ;;
     esac
-  done
-
-  if [[ $# -gt 0 ]] && [[ -z "$raw_target" ]]; then
-    raw_target="$1"
-    shift
-  fi
-
-  if [[ $# -gt 0 ]]; then
-    log_error "Unexpected positional argument: $1"
-    usage_status >&2
-    exit "$EX_USAGE"
-  fi
-
-  local dir
-  dir="$(resolve_target_dir "${raw_target:-.}")"
-
-  local envrc_file="${dir}/.envrc"
-  local has_block=false
-  local managed_ver=""
-
-  if [[ -f "$envrc_file" ]] && grep -Fq "$DENV_START_MARKER" "$envrc_file" 2>/dev/null; then
-    has_block=true
-    managed_ver="$(sed -n 's/^# Managed by denv v\([0-9.]*\).*/\1/p' "$envrc_file" | head -1)"
-  fi
-
-  # Quiet mode: just exit code
-  if [[ "$quiet" == true ]]; then
-    [[ "$has_block" == true ]] && exit "$EX_OK" || exit "$EX_ERR"
-  fi
-
-  local backend
-  backend="$(detect_backend "$dir")"
-  local backend_src
-  backend_src="$(detect_backend_source "$dir")"
-
-  local b="" r="" g="" y="" d=""
-  if [[ "$stdout_color" == true ]]; then
-    b=$'\033[1m'; r=$'\033[0m'; g=$'\033[32m'; y=$'\033[33m'; d=$'\033[2m'
-  fi
-
-  printf '\n%sdenv workspace status:%s %s\n\n' "$b" "$r" "$dir"
-
-  # Backend
-  printf '  %-20s %s %s(%s)%s\n' "Backend:" "${b}${backend}${r}" "$d" "$backend_src" "$r"
-
-  # Virtual environment
-  if [[ -f "${dir}/.venv/bin/activate" ]]; then
-    printf '  %-20s %s %s\n' "Virtual env:" ".venv/" "${g}exists${r}"
-  elif [[ -f "${dir}/venv/bin/activate" ]]; then
-    printf '  %-20s %s %s\n' "Virtual env:" "venv/" "${g}exists${r}"
+    case "$backend" in
+      conda|pixi) if [[ -d "${environment}/conda-meta" ]]; then ready=true; fi ;;
+      uv|venv|local-existing|poetry|pipenv|pdm|hatch) if [[ -n "$environment" && -f "${environment}/bin/activate" ]]; then ready=true; fi ;;
+      *) backend="unknown (run denv init --force)" ;;
+    esac
+    if [[ "$ready" == true ]]; then environment_state=exists; fi
+    if workspace_is_authorized "$target_dir"; then authorized=true; fi
   else
-    printf '  %-20s %s\n' "Virtual env:" "${y}not found${r}"
+    detect_workspace "$target_dir"
+    backend="$detected_backend"; source="$detected_source"
+    if [[ -f "${target_dir}/.venv/bin/activate" ]]; then environment="${target_dir}/.venv"; environment_state=exists
+    elif [[ -f "${target_dir}/venv/bin/activate" ]]; then environment="${target_dir}/venv"; environment_state=exists; fi
   fi
-
-  # .envrc
-  if [[ ! -e "$envrc_file" ]]; then
-    printf '  %-20s %s\n' ".envrc:" "${y}not created${r}"
-  elif [[ -L "$envrc_file" ]]; then
-    printf '  %-20s %s\n' ".envrc:" "${y}symlink (unsafe)${r}"
-  elif [[ "$has_block" == true ]]; then
-    printf '  %-20s %s %s\n' ".envrc:" "${g}managed by denv${r}" "${d}v${managed_ver:-unknown}${r}"
-  else
-    printf '  %-20s %s\n' ".envrc:" "present ${y}(no denv block)${r}"
+  if [[ "$cli_quiet" == false ]]; then
+    printf '\ndenv workspace status: %s\n\n' "$target_dir"
+    printf '  %-20s %s (%s)\n' "Backend:" "${backend:-unknown}" "$source"
+    printf '  %-20s %s\n' "Virtual env:" "${environment:-unknown} (${environment_state})"
+    printf '  %-20s %s\n' ".envrc:" "$envrc_state"
+    printf '  %-20s %s\n' "Authorized:" "$authorized"
+    if [[ -f "${target_dir}/.env" ]]; then
+      local count
+      count="$(grep -cE '^(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' "${target_dir}/.env" || true)"
+      printf '  %-20s present (%s variables)\n' ".env:" "${count:-0}"
+    else printf '  %-20s not present\n' ".env:"; fi
+    local pyver
+    if pyver="$(read_python_version "$target_dir")"; then printf '  %-20s %s\n' "Python version:" "$pyver"; fi
+    if [[ -e "${target_dir}/.denv.lock" || -L "${target_dir}/.denv.lock" ]]; then
+      local pid
+      pid="$(cat "${target_dir}/.denv.lock/pid" 2>/dev/null || true)"
+      printf '  %-20s present (PID %s)\n' "Lock:" "${pid:-unknown}"
+    else printf '  %-20s none\n' "Lock:"; fi
+    printf '\n'
   fi
-
-  # .env
-  if [[ -f "${dir}/.env" ]]; then
-    local var_count
-    var_count="$(grep -cE '^[A-Za-z_][A-Za-z0-9_]*=' "${dir}/.env" 2>/dev/null || true)"
-    var_count="${var_count:-0}"
-    printf '  %-20s %s %s\n' ".env:" "${g}present${r}" "${d}(${var_count} variable$([ "$var_count" != 1 ] && echo s))${r}"
-  else
-    printf '  %-20s %s\n' ".env:" "${d}not present${r}"
-  fi
-
-  # .python-version
-  local pyver
-  if pyver="$(read_python_version "$dir")"; then
-    printf '  %-20s %s\n' "Python version:" "${b}${pyver}${r}"
-  fi
-
-  # Lock
-  if [[ -d "${dir}/.denv.lock" ]]; then
-    local lock_pid=""
-    [[ -f "${dir}/.denv.lock/pid" ]] && lock_pid="$(cat "${dir}/.denv.lock/pid" 2>/dev/null || true)"
-    if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
-      printf '  %-20s %s\n' "Lock:" "${y}active (PID ${lock_pid})${r}"
-    else
-      printf '  %-20s %s\n' "Lock:" "${y}stale (PID ${lock_pid:-unknown})${r}"
-    fi
-  else
-    printf '  %-20s %s\n' "Lock:" "${d}none${r}"
-  fi
-
-  printf '\n'
-
-  [[ "$has_block" == true ]] && exit "$EX_OK" || exit "$EX_ERR"
+  [[ "$envrc_state" == managed && "$ready" == true && "$authorized" == true ]]
 }
-
-# --- Subcommand: clean ---
 
 cmd_clean() {
-  local raw_target=""
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -h|--help)
-        usage_clean
-        exit "$EX_OK"
-        ;;
-      -v|--version)
-        printf '%s version %s\n' "$SCRIPT_NAME" "$VERSION"
-        exit "$EX_OK"
-        ;;
-      --)
-        shift
-        break
-        ;;
-      -*)
-        log_error "Unknown option for 'clean': $1"
-        exit "$EX_USAGE"
-        ;;
-      *)
-        if [[ -z "$raw_target" ]]; then
-          raw_target="$1"
-          shift
-        else
-          log_error "Unexpected argument: $1"
-          exit "$EX_USAGE"
-        fi
-        ;;
-    esac
-  done
-
-  if [[ $# -gt 0 ]] && [[ -z "$raw_target" ]]; then
-    raw_target="$1"
-    shift
-  fi
-
-  if [[ $# -gt 0 ]]; then
-    log_error "Unexpected positional argument: $1"
-    usage_clean >&2
-    exit "$EX_USAGE"
-  fi
-
-  local dir
-  dir="$(resolve_target_dir "${raw_target:-.}")"
-
-  if [[ ! -w "$dir" ]]; then
-    log_error "Directory '${dir}' is not writable."
-    exit "$EX_NO_PERM"
-  fi
-
-  local envrc_file="${dir}/.envrc"
-  local cleaned=false
-
-  # Check symlink or remove denv block from .envrc
-  if [[ -L "$envrc_file" ]]; then
-    log_warn "Refusing to operate on symlinked '${envrc_file}'."
-  elif [[ -f "$envrc_file" ]]; then
-    if remove_denv_block "$envrc_file"; then
-      if [[ -f "$envrc_file" ]]; then
-        log_success "Removed denv block from '${envrc_file}' (custom content preserved)."
-      else
-        log_success "Removed '${envrc_file}' (was entirely managed by denv)."
-      fi
-      cleaned=true
-    else
-      log_info "No denv block found in '${envrc_file}'."
+  validate_writable_workspace
+  acquire_lock "$target_dir"
+  local envrc_file="${target_dir}/.envrc"
+  validate_envrc_for_write "$envrc_file"
+  if [[ "$envrc_state" == managed ]]; then
+    if command -v direnv >/dev/null 2>&1; then
+      direnv deny "$target_dir"
+      log_success "Revoked direnv authorization."
     fi
+    remove_denv_block "$envrc_file"
+    log_success "Removed denv configuration (custom content and environments preserved)."
   else
-    log_info "No .envrc file found."
-  fi
-
-  # Revoke direnv authorization
-  if command -v direnv >/dev/null 2>&1; then
-    direnv deny "$dir" 2>/dev/null || true
-    if [[ "$cleaned" == true ]]; then
-      log_success "Revoked direnv authorization for '${dir}'."
-    fi
-  fi
-
-  # Clean up stale lock
-  if [[ -d "${dir}/.denv.lock" ]]; then
-    local lock_pid=""
-    [[ -f "${dir}/.denv.lock/pid" ]] && lock_pid="$(cat "${dir}/.denv.lock/pid" 2>/dev/null || true)"
-    if [[ -z "$lock_pid" ]] || ! kill -0 "$lock_pid" 2>/dev/null; then
-      rm -rf -- "${dir}/.denv.lock"
-      log_success "Removed stale lock file."
-      cleaned=true
-    else
-      log_warn "Active lock (PID ${lock_pid}) — not removing."
-    fi
-  fi
-
-  if [[ "$cleaned" == false ]]; then
-    log_info "Workspace is already clean."
+    log_info "No denv block found; workspace is already clean."
   fi
 }
 
-# --- CLI Entrypoint ---
-
 main() {
-  # Global pre-scan: extract --no-color (respects -- separator)
-  local cli_color_mode="auto"
-  local filtered_args=()
-  local seen_separator=false
-  local arg
+  local command=init arg
+  init_colors auto
+  # Error messages also honor a later --no-color, without altering option values.
   for arg in "$@"; do
-    if [[ "$seen_separator" == false ]] && [[ "$arg" == "--" ]]; then
-      seen_separator=true
-      filtered_args+=("$arg")
-    elif [[ "$seen_separator" == false ]] && [[ "$arg" == "--no-color" ]]; then
-      cli_color_mode="never"
-    else
-      filtered_args+=("$arg")
-    fi
+    [[ "$arg" != -- ]] || break
+    if [[ "$arg" == --no-color ]]; then init_colors never; fi
   done
-
-  init_colors "$cli_color_mode"
-
-  if [[ ${#filtered_args[@]} -gt 0 ]]; then
-    set -- "${filtered_args[@]}"
-  else
-    set --
-  fi
-
-  # Global --help / --version (before subcommand dispatch)
+  while [[ "${1:-}" == --no-color ]]; do shift; done
   case "${1:-}" in
-    -h|--help|help)
-      usage_global
-      exit "$EX_OK"
-      ;;
-    -v|--version|version)
-      printf '%s version %s\n' "$SCRIPT_NAME" "$VERSION"
-      exit "$EX_OK"
-      ;;
+    -h|--help|help) usage_global; return 0 ;;
+    -v|--version|version) printf '%s version %s\n' "$SCRIPT_NAME" "$VERSION"; return 0 ;;
+    init|status|clean) command="$1"; shift ;;
   esac
-
-  # Subcommand dispatch
-  local subcommand="init"
-  if [[ $# -gt 0 ]] && [[ "$1" != -* ]]; then
-    case "$1" in
-      init|status|clean)
-        subcommand="$1"
-        shift
-        ;;
-    esac
-  fi
-
-  "cmd_${subcommand}" "$@"
+  parse_options "$command" "$@"
+  target_dir="$(resolve_target_dir "$cli_target")"
+  "cmd_${command}"
 }
 
 main "$@"

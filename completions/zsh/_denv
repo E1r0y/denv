@@ -1,78 +1,52 @@
 #compdef denv
 
-# Zsh completion for denv
+_denv_target() {
+  if [[ "$explicit" == false && "$words[CURRENT]" != */* ]]; then
+    local -a commands=(
+      'init:Bootstrap workspace configuration'
+      'status:Check workspace readiness'
+      'clean:Remove denv configuration'
+    )
+    _describe command commands
+  fi
+  _files -/
+}
 
 _denv() {
-  local -a backends
-  backends=(
-    'auto:Auto-detect backend based on project files'
-    'uv:Astral uv package and project manager'
-    'poetry:Poetry dependency manager'
-    'pipenv:Pipenv Python development workflow'
-    'pdm:Modern Python package and dependency manager'
-    'hatch:Hatch modern extensible project manager'
-    'conda:Conda / Mamba / Micromamba package manager'
-    'pixi:Pixi package manager based on conda ecosystem'
-    'venv:Standard library python3 -m venv'
-  )
-
-  local -a init_args
-  init_args=(
-    '(-b --backend)'{-b,--backend}'[Select environment backend]:backend:(($backends))'
-    '(-f --force)'{-f,--force}'[Regenerate or update denv block in .envrc]'
-    '(-n --no-create)'{-n,--no-create}'[Do not create virtual environment if missing]'
-    '(-g --git-exclude)'{-g,--git-exclude}'[Register artifacts in .git/info/exclude]'
-    '--no-color[Disable ANSI color output]'
-    '(-h --help)'{-h,--help}'[Print help message and exit]'
-    '(-v --version)'{-v,--version}'[Print version information and exit]'
-    '::workspace directory:_files -/'
-  )
-
-  local -a status_args
-  status_args=(
-    '(-q --quiet)'{-q,--quiet}'[Suppress output; exit 0 if configured, 1 otherwise]'
-    '--no-color[Disable ANSI color output]'
-    '(-h --help)'{-h,--help}'[Print help message and exit]'
-    '(-v --version)'{-v,--version}'[Print version information and exit]'
-    '::workspace directory:_files -/'
-  )
-
-  local -a clean_args
-  clean_args=(
-    '--no-color[Disable ANSI color output]'
-    '(-h --help)'{-h,--help}'[Print help message and exit]'
-    '(-v --version)'{-v,--version}'[Print version information and exit]'
-    '::workspace directory:_files -/'
-  )
-
-  local -a subcommands
-  subcommands=(
-    'init:Bootstrap workspace configuration (default)'
-    'status:Show current workspace state'
-    'clean:Remove denv configuration from workspace'
-  )
-
-  if (( CURRENT == 2 )); then
-    _arguments -s \
-      $init_args \
-      '1:subcommand:(($subcommands))'
-    return
+  local command=init explicit=false index=2
+  local -a args backends
+  backends=(auto uv poetry pipenv pdm hatch conda pixi venv)
+  while [[ "$words[index]" == --no-color ]] && (( index < CURRENT )); do
+    (( index++ ))
+  done
+  if (( index < CURRENT )); then
+    case "$words[index]" in
+      init|status|clean)
+        command="$words[index]"
+        explicit=true
+        words=("${(@)words[1,index-1]}" "${(@)words[index+1,-1]}")
+        (( CURRENT-- ))
+        ;;
+    esac
   fi
-
-  case "$words[2]" in
+  args=(
+    '--no-color[Disable ANSI color output]'
+    '(-h --help)'{-h,--help}'[Print help]'
+    '(-v --version)'{-v,--version}'[Print version]'
+    '::workspace directory:_denv_target'
+  )
+  case "$command" in
     init)
-      _arguments -s $init_args
-      ;;
-    status)
-      _arguments -s $status_args
-      ;;
-    clean)
-      _arguments -s $clean_args
-      ;;
-    *)
-      _arguments -s $init_args
-      ;;
+      args+=(
+        '(-b --backend)'{-b,--backend}'[Select environment backend]:backend:($backends)'
+        '(-f --force)'{-f,--force}'[Regenerate the denv block]'
+        '(-n --no-create)'{-n,--no-create}'[Do not create environments]'
+        '(-g --git-exclude)'{-g,--git-exclude}'[Exclude local artifacts from Git]'
+        '--no-allow[Write configuration without authorizing it]'
+      ) ;;
+    status) args+=('(-q --quiet)'{-q,--quiet}'[Return readiness without output]') ;;
   esac
+  _arguments -s "${args[@]}"
 }
 
 _denv "$@"

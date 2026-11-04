@@ -20,6 +20,8 @@ complete -c denv -n "__fish_seen_subcommand_from init; or not __fish_seen_subcom
 complete -c denv -n "__fish_seen_subcommand_from init; or not __fish_seen_subcommand_from $commands" -s g -l git-exclude -d "Hide .envrc and virtual environment in .git/info/exclude"
 complete -c denv -n "__fish_seen_subcommand_from init; or not __fish_seen_subcommand_from $commands" -a "(__fish_complete_directories)" -d "Target workspace directory"
 
+complete -c denv -n "__fish_seen_subcommand_from init; or not __fish_seen_subcommand_from $commands" -l no-allow -d "Write configuration without authorizing it"
+
 # status options
 complete -c denv -n "__fish_seen_subcommand_from status" -s q -l quiet -d "Suppress output; exit 0 if configured, 1 otherwise"
 complete -c denv -n "__fish_seen_subcommand_from status" -a "(__fish_complete_directories)" -d "Target workspace directory"

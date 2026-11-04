@@ -1,81 +1,45 @@
 # shellcheck shell=bash
-# shellcheck disable=SC2207
-# Bash completion for denv
-
+# Bash 3.2+ completion, also usable without bash-completion installed.
 _denv_completions() {
-  local cur prev words cword
-  if declare -F _init_completion >/dev/null 2>&1; then
-    _init_completion || return
-  else
-    COMPREPLY=()
-    cur="${COMP_WORDS[COMP_CWORD]}"
-    prev="${COMP_WORDS[COMP_CWORD-1]}"
-    words=("${COMP_WORDS[@]}")
-    cword=$COMP_CWORD
-  fi
-
-  local commands="init status clean"
+  local cur="${COMP_WORDS[COMP_CWORD]}" prev="" cmd=init
+  local token candidate i=1 separator=false target_seen=false explicit=false
   local backends="auto uv poetry pipenv pdm hatch conda pixi venv"
-  local init_opts="-b --backend -f --force -n --no-create -g --git-exclude --no-color -h --help -v --version"
-  local status_opts="-q --quiet --no-color -h --help -v --version"
-  local clean_opts="--no-color -h --help -v --version"
-  local global_opts="--no-color -h --help -v --version"
-
-  # Detect subcommand
-  local cmd=""
-  local i
-  for (( i=1; i < cword; i++ )); do
-    case "${words[i]}" in
-      init|status|clean)
-        cmd="${words[i]}"
-        break
-        ;;
-      -b|--backend)
-        ((i++))
-        ;;
-    esac
-  done
-
-  case "$prev" in
-    -b|--backend)
-      COMPREPLY=( $(compgen -W "$backends" -- "$cur") )
-      return 0
-      ;;
-  esac
-
-  if [[ -z "$cmd" ]]; then
-    if [[ "$cur" == -* ]]; then
-      COMPREPLY=( $(compgen -W "$global_opts $init_opts" -- "$cur") )
-      return 0
+  local options="--no-color -h --help -v --version"
+  COMPREPLY=()
+  if (( COMP_CWORD > 0 )); then prev="${COMP_WORDS[COMP_CWORD-1]}"; fi
+  while (( i < COMP_CWORD )); do
+    token="${COMP_WORDS[i]}"
+    if [[ "$separator" == true ]]; then target_seen=true
     else
-      COMPREPLY=( $(compgen -W "$commands" -- "$cur") $(compgen -d -- "$cur") )
-      return 0
+      case "$token" in
+        --) separator=true ;;
+        --no-color) ;;
+        -b|--backend) i=$((i + 1)) ;;
+        init|status|clean)
+          if [[ "$explicit" == false && "$target_seen" == false ]]; then cmd="$token"; explicit=true
+          else target_seen=true; fi ;;
+        -*) ;;
+        *) target_seen=true ;;
+      esac
     fi
+    i=$((i + 1))
+  done
+  if [[ "$separator" == false && "$cmd" == init && ( "$prev" == -b || "$prev" == --backend ) ]]; then
+    while IFS= read -r candidate; do COMPREPLY+=("$candidate"); done < <(compgen -W "$backends" -- "$cur")
+    return 0
   fi
-
   case "$cmd" in
-    init)
-      if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "$init_opts" -- "$cur") )
-      else
-        COMPREPLY=( $(compgen -d -- "$cur") )
-      fi
-      ;;
-    status)
-      if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "$status_opts" -- "$cur") )
-      else
-        COMPREPLY=( $(compgen -d -- "$cur") )
-      fi
-      ;;
-    clean)
-      if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "$clean_opts" -- "$cur") )
-      else
-        COMPREPLY=( $(compgen -d -- "$cur") )
-      fi
-      ;;
+    init) options="$options -b --backend -f --force -n --no-create -g --git-exclude --no-allow" ;;
+    status) options="$options -q --quiet" ;;
   esac
+  if [[ "$separator" == false && "$cur" == -* ]]; then
+    while IFS= read -r candidate; do COMPREPLY+=("$candidate"); done < <(compgen -W "$options" -- "$cur")
+  elif [[ "$target_seen" == false ]]; then
+    if [[ "$separator" == false && "$explicit" == false ]]; then
+      while IFS= read -r candidate; do COMPREPLY+=("$candidate"); done < <(compgen -W 'init status clean' -- "$cur")
+    fi
+    while IFS= read -r candidate; do COMPREPLY+=("$candidate"); done < <(compgen -d -- "$cur")
+  fi
+  return 0
 }
-
-complete -F _denv_completions -o default denv
+complete -F _denv_completions -o filenames -o default denv
