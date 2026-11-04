@@ -336,6 +336,14 @@ require_direnv() {
   if [[ "$version" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?$ ]]; then
     major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"
     if (( major > 2 || (major == 2 && minor >= 26) )); then
+      case "$target_dir" in
+        *'$'*|*'`'*|*'"'*|*"'"*|*\\*|*$'\n'*|*$'\r'*)
+          if (( major == 2 && minor < 38 )); then
+            log_error "Workspace paths containing shell syntax require direnv >= 2.38. Upgrade direnv before initializing this path."
+            exit "$EX_ERR"
+          fi
+          ;;
+      esac
       return 0
     fi
   fi
@@ -910,6 +918,14 @@ cmd_status() {
   [[ "$envrc_state" == managed && "$ready" == true && "$authorized" == true ]]
 }
 
+revoke_workspace_authorization() {
+  # Older direnv versions return an error if the current content has no
+  # allow entry. Check first, but propagate real failures of deny.
+  if [[ -f "${target_dir}/.envrc" ]] && workspace_is_authorized "$target_dir"; then
+    direnv deny "${target_dir}/.envrc" || return 1
+  fi
+}
+
 cmd_clean() {
   validate_writable_workspace
   acquire_lock "$target_dir"
@@ -917,10 +933,14 @@ cmd_clean() {
   validate_envrc_for_write "$envrc_file"
   if [[ "$envrc_state" == managed ]]; then
     if command -v direnv >/dev/null 2>&1; then
-      direnv deny "$target_dir"
-      log_success "Revoked direnv authorization."
+      revoke_workspace_authorization
     fi
     remove_denv_block "$envrc_file"
+    # Custom content may have been authorized before denv was appended.
+    if command -v direnv >/dev/null 2>&1; then
+      revoke_workspace_authorization
+      log_success "Revoked direnv authorization."
+    fi
     log_success "Removed denv configuration (custom content and environments preserved)."
   else
     log_info "No denv block found; workspace is already clean."

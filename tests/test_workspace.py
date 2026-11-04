@@ -127,10 +127,26 @@ exec {shlex.quote(awk)} "$@"
         environment = project / ".venv"
         (environment / "bin").mkdir(parents=True)
         (environment / "bin/activate").write_text("export DENV_QUOTED=yes\n")
+        version = self.run_command("direnv", "version").stdout.strip().split(".")
+        if tuple(int(value) for value in version[:2]) < (2, 38):
+            self.denv("-n", project, expected=1)
+            self.assertFalse((project / ".envrc").exists())
+            return
         self.denv("-n", project)
         self.denv("-n", "-f", project)
         self.run_command("direnv", "exec", project, "sh", "-c", 'test "$DENV_QUOTED" = yes')
         self.assertFalse((project / "BAD").exists())
+
+    def test_old_direnv_cannot_authorize_paths_with_shell_syntax(self):
+        project = self.work / "$(touch BAD)"
+        project.mkdir()
+        self.stub("direnv", '''#!/usr/bin/env bash
+[[ "$1" == version ]] || exit 99
+printf '2.32.1\\n'
+''')
+        self.denv("-b", "venv", "-n", project, expected=1)
+        self.assertFalse((project / ".envrc").exists())
+        self.assertFalse((self.work / "BAD").exists())
 
     def test_shared_parser_and_separator(self):
         for arguments in (("status", "--force"), ("clean", "--backend", "uv"), ("init", "-b"), ("status", ".", "."), ("init", "--", ".", ".")):
@@ -140,6 +156,48 @@ exec {shlex.quote(awk)} "$@"
         target.mkdir()
         self.denv("-b", "venv", "-n", "--", "--no-color")
         self.assertTrue((target / ".envrc").is_file())
+
+    def test_directory_alias_configures_physical_workspace(self):
+        environment = self.work / ".venv/bin"
+        environment.mkdir(parents=True)
+        (environment / "activate").write_text("export DENV_DIRECTORY_ALIAS=yes\n")
+        alias = self.root / "alias"
+        alias.symlink_to(self.work, target_is_directory=True)
+        self.denv("-n", alias)
+        self.denv("status", "-q", alias)
+        # direnv allow canonicalizes aliases, but some versions of exec do
+        # not. Test activation at the physical path used for authorization.
+        self.run_command("direnv", "exec", alias.resolve(), "sh", "-c", 'test "$DENV_DIRECTORY_ALIAS" = yes')
+
+    def test_clean_revokes_previously_authorized_custom_content(self):
+        envrc = self.work / ".envrc"
+        envrc.write_text("export KEEP=yes\n")
+        self.run_command("direnv", "allow", self.work)
+        self.denv("-b", "venv", "-n")
+        self.denv("clean")
+        self.assertEqual(envrc.read_text(), "export KEEP=yes\n")
+        status = self.run_command("direnv", "status").stdout
+        allowed = [line.split()[-1] for line in status.splitlines() if line.startswith("Found RC allowed ")]
+        self.assertTrue(allowed)
+        self.assertNotIn(allowed[0], {"0", "true"})
+
+    def test_clean_when_current_content_is_already_unauthorized(self):
+        self.denv("-b", "venv", "-n")
+        envrc = self.work / ".envrc"
+        envrc.write_text(envrc.read_text() + "export KEEP=yes\n")
+        real_direnv = shutil_which("direnv", self.env["PATH"])
+        self.stub("direnv", f'''#!/usr/bin/env bash
+if [[ "$1" == deny ]]; then
+  status_output=$({shlex.quote(real_direnv)} status)
+  if ! printf '%s\\n' "$status_output" | grep -Eq '^Found RC allowed (true|0)$'; then
+    printf 'current content is already unauthorized\\n' >&2
+    exit 1
+  fi
+fi
+exec {shlex.quote(real_direnv)} "$@"
+''')
+        self.denv("clean")
+        self.assertEqual(envrc.read_text(), "export KEEP=yes\n")
 
     def test_failed_early_assertion_makes_suite_fail(self):
         source = (REPO / "tests/test_denv.sh").read_text()

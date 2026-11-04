@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Correct Bash paths with spaces, Zsh subcommand completion, Makefile quoting, and shell setup instructions.
 - Fail the test suite on intermediate assertion errors and isolate test homes and caches.
 - Require direnv 2.26 or later for `dotenv_if_exists`.
+- Handle already-unauthorized content when cleaning with older direnv versions, and revoke any restored custom content's previous authorization.
+- Refuse shell-syntax workspace paths with older direnv loaders; normalize temporary-directory aliases in macOS tests.
 
 ### Changed
 - `status -q` succeeds only for a valid managed block, an existing environment, and current direnv authorization.

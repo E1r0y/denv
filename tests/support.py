@@ -16,7 +16,9 @@ class WorkspaceTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="denv-test-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        # macOS exposes its temporary directory through /var -> /private/var.
+        # Keep all test invocations on the same path unless testing an alias.
+        self.root = Path(self.temporary.name).resolve()
         self.work = self.root / "workspace with spaces"
         self.work.mkdir()
         self.tools = self.root / "tools"

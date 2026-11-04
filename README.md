@@ -8,6 +8,7 @@ Supports uv, Poetry, Pipenv, PDM, Hatch, Conda/Mamba/Micromamba, Pixi, and stand
 ## Quick start
 
 Install **Bash >= 3.2**, **direnv >= 2.26**, and your chosen environment manager (or Python 3 for venv).
+Workspace paths containing quotes, dollar signs, backticks, backslashes, or line breaks require **direnv >= 2.38**, whose loader handles those paths safely.
 Enable the direnv hook in your interactive shell:
 
 ```bash
@@ -108,6 +109,8 @@ Repeated `init` without `--force` leaves the managed block unchanged and skips e
 `status -q` returns 0 only when the managed block is valid, its environment exists, and the `.envrc` is authorized. It does not execute arbitrary `.envrc` code to prove that custom commands succeed. Old blocks without environment metadata require `denv init --force` to report readiness.
 
 `clean` acquires the same lock as `init`, revokes authorization while `.envrc` still exists, and removes only the managed block. It leaves custom content, virtual environments, and Git exclusions in place.
+
+Workspace paths are resolved to physical directories. When invoking `direnv exec` directly, pass a physical path: some direnv versions canonicalize paths for `allow` but keep directory aliases for `exec`. On macOS, `/var` and `/tmp` are commonly aliases of `/private/var` and `/private/tmp`.
 
 ## Backend behavior
 
