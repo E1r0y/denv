@@ -1,19 +1,13 @@
-# Formula for Homebrew Tap (e.g. E1r0y/homebrew-tap)
-# To publish:
-# 1. Create a GitHub repo named 'homebrew-tap' under your account (github.com/E1r0y/homebrew-tap).
-# 2. Place this file into 'Formula/denv.rb'.
-# 3. Calculate sha256 of the release tarball:
-#    curl -sL https://github.com/E1r0y/denv/archive/refs/tags/v1.3.0.tar.gz | sha256sum
-# 4. Users can then install via:
-#    brew tap E1r0y/tap
-#    brew install denv
+# Stable formula for the published release; --HEAD tracks main.
+# scripts/build_release.py generates an updated formula for each new release.
 
 class Denv < Formula
-  desc "Atomic, lightning-fast CLI workspace bootstrapper for Python environments and direnv"
+  desc "Configure Python project environments for direnv"
   homepage "https://github.com/E1r0y/denv"
   url "https://github.com/E1r0y/denv/archive/refs/tags/v1.3.0.tar.gz"
-  sha256 "PUT_RELEASE_TARBALL_SHA256_HERE"
+  sha256 "a19a1abd500fc90822ebc8de3fd786ca67396f6eee27679e47d16b3cda0e1407"
   license "MIT"
+  head "https://github.com/E1r0y/denv.git", branch: "main"
 
   depends_on "direnv"
 
@@ -26,6 +20,9 @@ class Denv < Formula
 
   test do
     assert_match "denv version", shell_output("#{bin}/denv --version")
-    assert_match "denv status", shell_output("#{bin}/denv status 2>&1", 1)
+    assert_match "denv workspace status", shell_output("#{bin}/denv status 2>&1", 1)
+    system bin/"denv", "init", "--backend", "venv", "--no-create"
+    assert_match "dotenv_if_exists .env", (testpath/".envrc").read
+    system "bash", "-n", testpath/".envrc"
   end
 end

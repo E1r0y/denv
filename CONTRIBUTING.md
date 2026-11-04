@@ -1,130 +1,58 @@
-# Contributing to denv
+# Contributing
 
-Thank you for your interest in contributing to `denv`! This document outlines guidelines and instructions for submitting contributions, reporting issues, and testing changes locally.
+The installed CLI is a single Bash script. Keep runtime compatibility with Bash 3.2, GNU/BSD utilities, and direnv 2.26 or later.
 
----
+## Development
 
-## Code of Conduct
+Use `./install.sh --symlink` or `make link` for local development; use `--force` when replacing an existing script installation. Tests write to temporary homes, caches, and workspaces. They must not change your normal direnv authorization or project environments.
 
-We are committed to providing a welcoming, inclusive, and harassment-free environment for everyone. Please be respectful and constructive in all discussions, pull requests, and issue reports.
-
----
-
-## Getting Started & Repository Structure
-
-`denv` is intentionally built with zero heavy runtime dependencies (pure Bash and standard UNIX utilities).
-
-```
-denv/
-├── bin/
-│   └── denv                     # Main CLI executable
-├── completions/
-│   ├── bash/denv                # Bash tab completions
-│   ├── zsh/_denv                # Zsh tab completions
-│   └── fish/denv.fish           # Fish tab completions
-├── tests/
-│   └── test_denv.sh             # Integration test suite
-├── install.sh                   # Production-ready installer (local & remote)
-├── Makefile                     # UNIX install, link, test targets
-└── .github/
-    └── workflows/ci.yml         # CI pipeline (Ubuntu & macOS)
-```
-
----
-
-## Local Development Workflow
-
-### 1. Prerequisites
-
-- **Bash** `>= 3.2`
-- **direnv** `>= 2.21`
-- **shellcheck** (optional, recommended for static analysis)
-- `make` and standard POSIX utilities (`awk`, `sed`, `grep`, `mktemp`)
-
-### 2. Fast Developer Symlink Mode
-
-To work on `denv` and have your edits immediately reflected in your terminal:
+Development checks require Python 3.12+, Bash, direnv, and make. ShellCheck, Zsh, and Fish enable additional checks; CI requires all three.
 
 ```bash
-make link
-```
-
-This symlinks `bin/denv` and shell completions directly into `~/.local/bin` and `~/.local/share/...`.
-
-To remove the symlinks:
-
-```bash
-make uninstall
-```
-
-### 3. Running the Test Suite
-
-Always verify your changes before opening a pull request:
-
-```bash
+make checksums       # After changing bin/denv or completion files
 make test
+# Optional smoke tests against actual installed managers:
+DENV_TEST_REAL_BACKENDS=uv,poetry,pipenv,pdm,hatch make test
+# Optional Conda/Pixi smoke tests (isolated, dependency-free environments):
+DENV_TEST_REAL_CONDA_PIXI=micromamba,pixi python3 tests/test_backends.py BackendTests.test_real_conda_and_pixi
+# Reproducible performance measurements:
+make bench
 ```
 
-`make test` performs:
-1. Syntax validation (`bash -n`) across all scripts.
-2. Static analysis (`shellcheck`) on `bin/denv`, `install.sh`, `tests/test_denv.sh`, and `completions/bash/denv` (if `shellcheck` is installed).
-3. The end-to-end integration test suite (`tests/test_denv.sh`).
+`tests/requirements-managers.txt` pins the manager versions exercised by CI. Install those into a disposable development environment when running smoke tests. They are not runtime dependencies of denv.
 
----
+To test an older Bash, put a `bash` symlink to that binary first in PATH and pass `BASH=/path/to/bash` to make. This covers scripts whose shebang uses `/usr/bin/env bash` as well as direct test invocations.
 
-## Code Conventions & Design Principles
+## Structure
 
-When modifying or adding features to `denv`, strictly adhere to these architectural rules:
+- `bin/denv`: common argument parsing; environment detection and resolution; safe file operations; lock handling; init/status/clean.
+- `install.sh`: atomic local/remote installation, immutable commit resolution, checksum verification, and shell setup hints.
+- `completions/`: Bash, Zsh, and Fish completion definitions.
+- `tests/test_denv.sh`: basic CLI coverage with a strict background-process runner.
+- `tests/test_regressions.sh`: regressions for the audited failure modes.
+- `tests/test_*.py`: filesystem/concurrency, real completion engines, backend command contracts, installer transports, and release artifacts.
+- `tests/fixtures/backend.py`: offline command adapters; unexpected manager commands fail.
+- `scripts/checksums.py`: distributed-file manifest.
+- `scripts/build_release.py`: deterministic tarball, SHA256SUMS, and generated Homebrew formula.
+- `scripts/benchmark.py`: complete direnv exec measurements.
 
-1. **Strict Shell Safety:**
-   - Always run under `set -Eeuo pipefail`.
-   - Never quote flags dynamically; quote all variables and array expansions (`"$var"`, `"${array[@]}"`).
-2. **Ahead-of-Time (AoT) Performance:**
-   - Never write dynamic logic into `.envrc` that executes slow subshells or launches Python during directory transitions.
-   - All path resolutions must happen once at bootstrap time in `denv`, writing static `source /path/to/bin/activate` or `eval` blocks.
-3. **Atomic & Non-Destructive File Operations:**
-   - Always write to a temporary file via `mktemp` and atomically rename (`mv -f`).
-   - Do not overwrite custom user variables in `.envrc`. All denv-managed logic must remain strictly inside the sentinel markers:
-     ```bash
-     # >>> denv initialize >>>
-     ...
-     # <<< denv initialize <<<
-     ```
-4. **Stream Separation:**
-   - Informational logs, warnings, and errors must flow to `stderr` (`>&2`).
-   - `stdout` is reserved exclusively for CLI data (`denv status`), `--help`, and `--version`.
-5. **Standard Exit Codes:**
-   - Use sysexits-style exit codes: `0` (EX_OK), `1` (EX_ERR), `2` (EX_USAGE), `77` (EX_NO_PERM), `127` (EX_CMD_NOT_FOUND).
-6. **Path Escaping:**
-   - Always escape paths written to shell scripts using `printf '%q'`.
+## Changes and tests
 
----
+Exercise behavior through the CLI and command adapters, including the generated `.envrc` loading through real direnv. Reproduce a bug before fixing it, and retain a regression that catches its actual symptom. Run tests outside conditionals that disable Bash errexit; an early failed assertion must fail its test.
 
-## Adding a New Environment Backend
+Keep backend detection and argument parsing centralized. A new backend needs read-only lookup, validated environment paths, explicit creation, defined `--no-create` behavior, command-contract tests, and completion/documentation updates. Directory entry must not silently create environments or install dependencies.
 
-To add support for a new Python package or environment manager:
+Preserve user content and permissions. Validate managed markers before any side effect; use the workspace lock for every mutating command. Write replacements completely before atomic rename. Never infer that a PID-less lock is stale. Do not evaluate configuration metadata as shell code. Quote shell paths with `printf '%q'`.
 
-1. **Detect backend** in `detect_backend()` and `detect_backend_source()` (`bin/denv`):
-   - Check for characteristic lockfiles or configuration files (e.g. `foo.lock`, `foo.toml`).
-2. **Resolve activation path** in `build_activation_snippet()`:
-   - Query the tool for its virtual environment path.
-   - Fall back to dynamic layout if the environment is uninitialized and `--no-create` is passed.
-3. **Update valid backends list:**
-   - Add the backend name to `VALID_BACKENDS` in `bin/denv`.
-   - Update completions in `completions/bash/denv`, `completions/zsh/_denv`, and `completions/fish/denv.fish`.
-4. **Add integration test:**
-   - Add a test case in `tests/test_denv.sh` verifying that the tool's lockfile triggers backend detection.
-5. **Update documentation:**
-   - Add the backend to `README.md`.
+Diagnostics belong on stderr; help, version, and status data belong on stdout. Maintain the documented exit conventions and report external command failures honestly.
 
----
+## Releases
 
-## Submitting Pull Requests
+1. Update `VERSION` in `bin/denv`, `INSTALLER_VERSION` in `install.sh`, and the changelog to the same new version.
+2. Run `make checksums` and `make test`.
+3. Preview assets outside the repository: `python3 scripts/build_release.py /tmp/denv-release --tag vX.Y.Z`.
+4. Commit changes, then create and push the matching tag when ready to publish.
 
-1. Fork the repository and create your branch from `main`:
-   ```bash
-   git checkout -b feature/my-new-feature
-   ```
-2. Commit your changes with clear, descriptive commit messages (e.g. `feat: add support for foo backend` or `fix: handle edge case in path escaping`).
-3. Ensure all tests pass (`make test`).
-4. Push your branch to GitHub and open a Pull Request.
+The release workflow checks the version/tag, runs tests, and publishes the tarball, SHA256SUMS, and an updated `denv.rb`. It marks prerelease tags appropriately. Copy that generated formula into your Homebrew tap. The checked-in formula remains usable for the last stable release; its `head` spec follows main. Archive timestamps use `SOURCE_DATE_EPOCH` when supplied, otherwise the checkout's commit time (zero outside a Git checkout).
+
+Keep discussion constructive. Bug reports should include versions, a minimal reproduction, and redacted diagnostic output. Do not include real `.env` values, access tokens, or private keys.

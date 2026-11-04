@@ -1,0 +1,6 @@
+# Optional development tools used by the real-manager CI smoke tests.
+uv==0.13.7
+poetry==2.5.1
+pipenv==2026.10.5
+pdm==2.29.5
+hatch==1.18.2

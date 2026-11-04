@@ -21,12 +21,14 @@ A clear and concise description of what you expected to happen.
 **Environment Information (please complete the following):**
 - **OS:** [e.g. Ubuntu 24.04, macOS Sonoma 14.4, WSL2]
 - **Shell:** [e.g. Bash 5.2, Zsh 5.9, Fish 3.7]
+- **Bash runtime:** [output of `bash --version`, even when using Zsh or Fish]
 - **denv version:** [e.g. `denv --version`]
-- **direnv version:** [e.g. `direnv --version`]
+- **direnv version:** [output of `direnv version`]
 - **Python package manager:** [e.g. uv 0.4.x, poetry 1.8.x, venv]
 
 **Diagnostic Output**
 If possible, run the command with `DENV_DEBUG=1` and paste the output here:
+Redact credentials, private keys, and sensitive paths. Do not paste real `.env` values.
 ```bash
 DENV_DEBUG=1 denv ...
 ```

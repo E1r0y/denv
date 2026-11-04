@@ -2,49 +2,108 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
-    name: Test on ${{ matrix.os }}
+    name: Test ${{ matrix.os }} (${{ matrix.bash }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, macos-latest ]
-
+        include:
+          - os: ubuntu-latest
+            bash: /bin/bash
+          - os: macos-latest
+            bash: /bin/bash
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Install dependencies (direnv, shellcheck)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Install test dependencies
         run: |
-          if [[ "${{ runner.os }}" == "macOS" ]]; then
-            brew install direnv shellcheck
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            brew install direnv shellcheck zsh fish
           else
-            sudo apt-get update && sudo apt-get install -y direnv shellcheck
+            sudo apt-get update
+            sudo apt-get install -y direnv shellcheck zsh fish
           fi
-
-      - name: Run syntax checks & integration tests
-        run: make test
-
-      - name: Verify Makefile targets
+      - name: Select Bash for scripts and shebangs
         run: |
-          make link PREFIX="$HOME/.local"
-          "$HOME/.local/bin/denv" --version
-          make uninstall PREFIX="$HOME/.local"
-          make install PREFIX="$HOME/.local"
-          "$HOME/.local/bin/denv" --version
-          make uninstall PREFIX="$HOME/.local"
+          mkdir -p "$RUNNER_TEMP/test-shell"
+          ln -s /bin/bash "$RUNNER_TEMP/test-shell/bash"
+          echo "$RUNNER_TEMP/test-shell" >> "$GITHUB_PATH"
+          /bin/bash --version
+      - name: Run checks and integration tests
+        run: make test BASH=/bin/bash
+      - name: Build and retain release preview
+        run: python3 scripts/build_release.py "$RUNNER_TEMP/release-preview"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-preview-${{ matrix.os }}
+          path: ${{ runner.temp }}/release-preview/*
 
-      - name: Verify installer script
+  real-managers:
+    name: Real Python managers
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Install smoke-test tools
         run: |
-          ./install.sh --version
-          ./install.sh --help
-          ./install.sh --no-color
-          ./install.sh -b "$HOME/.test-bin" -f
-          "$HOME/.test-bin/denv" --version
-          ./install.sh -u -b "$HOME/.test-bin"
+          sudo apt-get update
+          sudo apt-get install -y direnv
+          python -m pip install -r tests/requirements-managers.txt
+      - name: Test environment creation and activation
+        env:
+          DENV_TEST_REAL_BACKENDS: uv,poetry,pipenv,pdm,hatch
+        run: python3 tests/test_backends.py
 
+  conda-pixi:
+    name: Real Micromamba and Pixi
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Install pinned manager binaries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y direnv
+          mkdir -p "$RUNNER_TEMP/manager-tools"
+          cd "$RUNNER_TEMP/manager-tools"
+          curl -fsSL https://micro.mamba.pm/api/micromamba/linux-64/2.10.0 -o micromamba.tar.bz2
+          curl -fsSL https://github.com/prefix-dev/pixi/releases/download/v0.83.0/pixi-x86_64-unknown-linux-musl.tar.gz -o pixi.tar.gz
+          echo '9a97976244929bbae28fb1fae504e74a3e7e6d1932870e3a03321f01b7fbd07b  micromamba.tar.bz2' | sha256sum -c -
+          echo '064f371e692aaa3400ac581c89da2843c91437f20c2d9155395a5d0037f33551  pixi.tar.gz' | sha256sum -c -
+          tar -xjf micromamba.tar.bz2 bin/micromamba
+          tar -xzf pixi.tar.gz
+          echo "$RUNNER_TEMP/manager-tools/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/manager-tools" >> "$GITHUB_PATH"
+      - name: Test environment creation and activation
+        env:
+          DENV_TEST_REAL_CONDA_PIXI: micromamba,pixi
+        run: python3 tests/test_backends.py BackendTests.test_real_conda_and_pixi
