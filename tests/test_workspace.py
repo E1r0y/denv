@@ -12,6 +12,19 @@ from support import BASH, DENV, REPO, WorkspaceTest
 
 
 class WorkspaceTests(WorkspaceTest):
+    def test_status_consumes_complete_direnv_output(self):
+        self.denv("-b", "venv", "-n")
+        environment = self.work / ".venv/bin"
+        environment.mkdir(parents=True)
+        (environment / "activate").write_text("# fixture activation\n")
+        self.stub("direnv", '''#!/usr/bin/env bash
+[[ "$1" == status ]] || exit 99
+printf 'Found RC allowed 0\\n'
+sleep 0.1
+printf 'Found RC allowPath /tmp/fixture\\n'
+''')
+        self.denv("status", "-q")
+
     def wait_for(self, path):
         deadline = time.monotonic() + 5
         while not path.exists() and time.monotonic() < deadline:
