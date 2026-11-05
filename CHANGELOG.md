@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Existing installations require `install.sh --force`; uninstall only removes the selected installation scope.
 
 ### Added
+- Release publication requires a commit on main with successful push CI.
 - `--no-allow` for reviewing generated configuration before authorizing it.
 - Backend contract tests, real-manager smoke tests, concurrent-process tests, and interactive shell completion tests.
 - Reproducible release archives, generated Homebrew formulas, verified download manifests, and a local benchmark.
