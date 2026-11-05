@@ -2,6 +2,14 @@
 
 The installed CLI is a single Bash script. Keep runtime compatibility with Bash 3.2, GNU/BSD utilities, and direnv 2.26 or later.
 
+## Branches and pull requests
+
+Start each task in a short-lived branch and keep each PR focused on one change. Push commits to that branch, open a PR against `main`, and review its diff and test results before merging.
+
+`main` requires a PR, an up-to-date base, and successful Ubuntu, macOS, Python-manager, and Micromamba/Pixi checks from GitHub Actions. Direct updates, force pushes, and deletion are blocked, including for administrators. All review conversations must be resolved. Required approving reviews are set to zero so a sole maintainer can complete their own work.
+
+Use squash merge. GitHub deletes merged branches automatically and supports auto-merge after requirements pass. Dependency updates follow the same process; update an outdated PR branch and rerun checks before merging. If the API token lacks workflow scope, update workflow branches using normal Git authentication rather than bypassing protection.
+
 ## Development
 
 Use `./install.sh --symlink` or `make link` for local development; use `--force` when replacing an existing script installation. Tests write to temporary homes, caches, and workspaces. They must not change your normal direnv authorization or project environments.
@@ -34,6 +42,7 @@ To test an older Bash, put a `bash` symlink to that binary first in PATH and pas
 - `tests/fixtures/backend.py`: offline command adapters; unexpected manager commands fail.
 - `scripts/checksums.py`: distributed-file manifest.
 - `scripts/build_release.py`: deterministic tarball, SHA256SUMS, and generated Homebrew formula.
+- `scripts/verify_release.py`: require the release commit to belong to `main` and have successful push CI.
 - `scripts/benchmark.py`: complete direnv exec measurements.
 
 ## Changes and tests
@@ -51,8 +60,9 @@ Diagnostics belong on stderr; help, version, and status data belong on stdout. M
 1. Update `VERSION` in `bin/denv`, `INSTALLER_VERSION` in `install.sh`, and the changelog to the same new version.
 2. Run `make checksums` and `make test`.
 3. Preview assets outside the repository: `python3 scripts/build_release.py /tmp/denv-release --tag vX.Y.Z`.
-4. Commit changes, then create and push the matching tag when ready to publish.
+4. Commit changes in a working branch, merge the PR after its checks pass, and wait for successful push CI on `main`.
+5. Create and push the matching tag at that exact tested commit when ready to publish.
 
-The release workflow checks the version/tag, runs tests, and publishes the tarball, SHA256SUMS, and an updated `denv.rb`. It marks prerelease tags appropriately. Copy that generated formula into your Homebrew tap. The checked-in formula remains usable for the last stable release; its `head` spec follows main. Archive timestamps use `SOURCE_DATE_EPOCH` when supplied, otherwise the checkout's commit time (zero outside a Git checkout).
+The release workflow verifies that the commit belongs to `main` and has successful push CI, checks the version/tag, runs tests, and publishes the tarball, SHA256SUMS, and an updated `denv.rb`. It marks prerelease tags appropriately. Copy that generated formula into your Homebrew tap. The checked-in formula remains usable for the last stable release; its `head` spec follows main. Archive timestamps use `SOURCE_DATE_EPOCH` when supplied, otherwise the checkout's commit time (zero outside a Git checkout).
 
 Keep discussion constructive. Bug reports should include versions, a minimal reproduction, and redacted diagnostic output. Do not include real `.env` values, access tokens, or private keys.

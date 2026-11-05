@@ -164,7 +164,7 @@ Failures from external manager commands may retain that command's nonzero exit c
 
 ## Development and performance
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Run `make test` for syntax, lint, filesystem/installer/backend tests, and available shell completion engines. Update distributed-file checksums with `make checksums`.
+Changes enter `main` through a PR with all required CI checks passing against the current base. Releases are tagged from tested `main` commits; the release workflow verifies that history and CI before publishing. See [CONTRIBUTING.md](CONTRIBUTING.md). Run `make test` for syntax, lint, filesystem/installer/backend tests, and available shell completion engines. Update distributed-file checksums with `make checksums`.
 
 `make bench` measures complete `direnv exec` runs against empty and venv workspaces, reporting median and p95 times with the system and direnv version. It includes process startup and is not an interactive-shell latency guarantee. Conda hooks and custom `.envrc` commands have different costs; no fixed timing is promised.
 
