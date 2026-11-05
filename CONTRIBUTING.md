@@ -62,6 +62,7 @@ Diagnostics belong on stderr; help, version, and status data belong on stdout. M
 3. Preview assets outside the repository: `python3 scripts/build_release.py /tmp/denv-release --tag vX.Y.Z`.
 4. Commit changes in a working branch, merge the PR after its checks pass, and wait for successful push CI on `main`.
 5. Create and push the matching tag at that exact tested commit when ready to publish.
+6. After publication, update `packaging/homebrew/denv.rb` from the released `denv.rb` through a separate PR.
 
 The release workflow verifies that the commit belongs to `main` and has successful push CI, checks the version/tag, runs tests, and publishes the tarball, SHA256SUMS, and an updated `denv.rb`. It marks prerelease tags appropriately. Copy that generated formula into your Homebrew tap. The checked-in formula remains usable for the last stable release; its `head` spec follows main. Archive timestamps use `SOURCE_DATE_EPOCH` when supplied, otherwise the checkout's commit time (zero outside a Git checkout).
 
