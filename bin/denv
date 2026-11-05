@@ -866,7 +866,9 @@ decode_environment() {
 
 workspace_is_authorized() {
   command -v direnv >/dev/null 2>&1 || return 1
-  (cd -- "$1" && LC_ALL=C direnv status) 2>/dev/null | grep -Eq '^Found RC allowed (true|0)$'
+  # Consume all output: grep -q can close the pipe before direnv finishes,
+  # making pipefail report SIGPIPE even when the authorization line matched.
+  (cd -- "$1" && LC_ALL=C direnv status) 2>/dev/null | grep -E '^Found RC allowed (true|0)$' >/dev/null
 }
 
 cmd_status() {
